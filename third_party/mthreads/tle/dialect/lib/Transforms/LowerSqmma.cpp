@@ -118,6 +118,20 @@ static ttg::LocalAllocOp findRootAlloc(Value value) {
   while (value && visited.insert(value.getAsOpaquePointer()).second) {
     if (auto alloc = value.getDefiningOp<ttg::LocalAllocOp>())
       return alloc;
+    // An explicit warp-specialize capture is represented inside every
+    // isolated partition by a block argument at the same ordinal as the
+    // capture on WarpSpecializePartitionsOp.  Recover the parent SSA value so
+    // SQMMA layout inference can continue to the underlying local_alloc.
+    if (auto blockArg = dyn_cast<BlockArgument>(value)) {
+      Block *block = blockArg.getOwner();
+      auto partitions = dyn_cast_or_null<ttg::WarpSpecializePartitionsOp>(
+          block->getParentOp());
+      if (partitions &&
+          blockArg.getArgNumber() < partitions.getExplicitCaptures().size()) {
+        value = partitions.getExplicitCaptures()[blockArg.getArgNumber()];
+        continue;
+      }
+    }
     Operation *def = value.getDefiningOp();
     if (auto index = dyn_cast_or_null<ttg::MemDescIndexOp>(def))
       value = index.getSrc();
@@ -211,8 +225,21 @@ static LogicalResult updateOperandLayout(musa_tle::SqmmaOp op,
 
   auto order = ttg::getOrder(operandTy);
   auto cga = ttg::getCGALayout(operandTy.getEncoding());
+  // A rank-preserving subslice is only a logical SQMMA view.  Its swizzle is
+  // governed by the full physical matrix allocation that TME fills.  Using
+  // the final K=64 view shape here selects a 64-byte-row carrier which cannot
+  // represent a single 128x128 root TME landing.  Select the carrier from the
+  // trailing physical allocation shape instead, while retaining the logical
+  // view shape in desiredTy below.
+  SmallVector<int64_t> physicalShape(operandTy.getShape().begin(),
+                                     operandTy.getShape().end());
+  if (operandTy.getAllocShape().size() >= operandTy.getRank()) {
+    ArrayRef<int64_t> allocTail =
+        operandTy.getAllocShape().take_back(operandTy.getRank());
+    physicalShape.assign(allocTail.begin(), allocTail.end());
+  }
   auto shared = mmaEnc.composeSharedLayoutForOperand(
-      cga, operandIdx, operandTy.getShape(), order,
+      cga, operandIdx, physicalShape, order,
       /*kWidth=*/0, operandTy.getElementTypeBitWidth(),
       /*needTrans=*/false);
 
@@ -237,7 +264,21 @@ static LogicalResult updateOperandLayout(musa_tle::SqmmaOp op,
     landingTy = *sourceTy;
   }
 
-  if (failed(musa::resolveTMESwizzleConfigFromEncoding(landingTy)))
+  // Validate the physical carrier at the full allocation shape.  The final
+  // logical landing may be a K=64 subslice; testing its reduced shape would
+  // incorrectly reject a carrier intentionally chosen for the 128-wide root.
+  SmallVector<int64_t> landingPhysicalShape(landingTy.getShape().begin(),
+                                            landingTy.getShape().end());
+  if (landingTy.getAllocShape().size() >= landingTy.getRank()) {
+    ArrayRef<int64_t> allocTail =
+        landingTy.getAllocShape().take_back(landingTy.getRank());
+    landingPhysicalShape.assign(allocTail.begin(), allocTail.end());
+  }
+  auto physicalLandingTy = ttg::MemDescType::get(
+      landingPhysicalShape, landingTy.getElementType(),
+      landingTy.getEncoding(), landingTy.getMemorySpace(),
+      landingTy.getMutableMemory(), landingPhysicalShape);
+  if (failed(musa::resolveTMESwizzleConfigFromEncoding(physicalLandingTy)))
     return op.emitOpError(
                "inferred physical SQMMA landing layout is not uniquely "
                "TME-compatible for operand ")
@@ -310,12 +351,49 @@ static LogicalResult updateOperandLayout(musa_tle::SqmmaOp op,
       if (srcTy.getRank() != dstTy.getRank() + 1 ||
           !llvm::is_contained(rootAliases, index.getSrc()))
         return;
-      if (index.getResult().getType() != landingTy) {
-        index.getResult().setType(landingTy);
+      // A stage index may feed a rank-preserving subslice before SQMMA.  The
+      // physical layout must follow the SQMMA landing buffer, but the index
+      // result must still have srcShape[1:] (for example 128x128 rather than
+      // a final 64x64 K/row tile).  Reusing landingTy here made MemDescIndexOp
+      // invalid as soon as an exact v236-style subslice was present.
+      auto indexedTy = ttg::MemDescType::get(
+          dstTy.getShape(), dstTy.getElementType(), landingEncoding,
+          dstTy.getMemorySpace(), dstTy.getMutableMemory(),
+          dstTy.getAllocShape());
+      if (index.getResult().getType() != indexedTy) {
+        index.getResult().setType(indexedTy);
         (void)checkAndSet(index.getOperation());
         changed = true;
       }
+      if (!llvm::is_contained(rootAliases, index.getResult())) {
+        rootAliases.push_back(index.getResult());
+        changed = true;
+      }
     });
+    // Producer-side TME copies create their own subslice SSA values.  They
+    // alias the same physical root as the SQMMA-side views and therefore must
+    // inherit the inferred landing encoding as well.  Propagating only to the
+    // SQMMA operand left these views at the placeholder vec=1 layout, which
+    // made TME lowering reject an otherwise valid 128x64 block.
+    root->getParentOfType<tt::FuncOp>().walk(
+        [&](ttg::MemDescSubsliceOp subslice) {
+          if (!llvm::is_contained(rootAliases, subslice.getSrc()))
+            return;
+          auto dstTy = cast<ttg::MemDescType>(subslice.getType());
+          auto viewTy = ttg::MemDescType::get(
+              dstTy.getShape(), dstTy.getElementType(), landingEncoding,
+              dstTy.getMemorySpace(), dstTy.getMutableMemory(),
+              dstTy.getAllocShape());
+          if (subslice.getResult().getType() != viewTy) {
+            subslice.getResult().setType(viewTy);
+            (void)checkAndSet(subslice.getOperation());
+            changed = true;
+          }
+          if (!llvm::is_contained(rootAliases, subslice.getResult())) {
+            rootAliases.push_back(subslice.getResult());
+            changed = true;
+          }
+        });
   }
   return success();
 }
