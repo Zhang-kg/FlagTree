@@ -862,8 +862,28 @@ private:
     for (unsigned fieldIndex = 0; fieldIndex < state.fields.size();
          ++fieldIndex)
       fields.push_back(fieldIndex);
+
+    FailureOr<PipeStaticPartitionInfo> placement = getEndpointPlacement(op);
+    if (failed(placement))
+      return failure();
+    // A logical pipe may have one producer in each static warp-specialize
+    // partition.  Acquire/commit operations in the same partition belong to
+    // the same writer endpoint; the first operation observed in a new
+    // partition creates the next writer endpoint.  Writers are initialized
+    // before readers, so their endpoint indices remain a dense prefix.
+    for (const PipeEndpointState &endpoint : state.endpoints) {
+      if (endpoint.role != PipeEndpointRole::Writer)
+        break;
+      if (!samePlacement(endpoint, *placement))
+        continue;
+      return recordEndpoint(state, op, PipeEndpointRole::Writer,
+                            endpoint.index, endpoint.name, std::nullopt,
+                            fields);
+    }
+    unsigned writerIndex = state.endpoints.size();
+    std::string writerName = "writer" + std::to_string(writerIndex);
     return recordEndpoint(state, op, PipeEndpointRole::Writer,
-                          /*expectedIndex=*/0, "writer", std::nullopt, fields);
+                          writerIndex, writerName, std::nullopt, fields);
   }
 
   LogicalResult recordReader(PipeState &state, Operation *op,
@@ -929,19 +949,27 @@ private:
           return failure();
       }
 
+      unsigned writerCount = static_cast<unsigned>(llvm::count_if(
+          state.endpoints, [](const PipeEndpointState &endpoint) {
+            return endpoint.role == PipeEndpointRole::Writer;
+          }));
+      if (writerCount == 0)
+        return state.create.emitOpError("pipe requires a writer endpoint");
+
       if (declaredReaders.empty()) {
         for (PipeReaderWaitOp wait : state.waits) {
-          if (failed(recordReader(state, wait, /*endpointIndex=*/1, "")))
+          if (failed(recordReader(state, wait, writerCount, "")))
             return failure();
         }
         for (PipeReaderReleaseOp release : state.releases) {
-          if (failed(recordReader(state, release, /*endpointIndex=*/1, "")))
+          if (failed(recordReader(state, release, writerCount, "")))
             return failure();
         }
       } else {
         for (auto [readerOffset, readerName] :
              llvm::enumerate(declaredReaders)) {
-          unsigned endpointIndex = static_cast<unsigned>(readerOffset) + 1;
+          unsigned endpointIndex =
+              static_cast<unsigned>(readerOffset) + writerCount;
           bool found = false;
           for (PipeReaderWaitOp wait : state.waits) {
             if (wait->getAttrOfType<StringAttr>("reader_name") != readerName)
@@ -989,6 +1017,11 @@ private:
   // consumer's control flow or of initialization of every payload byte.
   LogicalResult collectCommitEffects(PipeState &state, PipeCommitGroup &group) {
     llvm::DenseSet<Operation *> seen;
+    const PipeEndpointState *writerEndpoint =
+        result->lookupEndpoint(group.commit);
+    if (!writerEndpoint || writerEndpoint->role != PipeEndpointRole::Writer)
+      return group.commit.emitOpError(
+          "internal MUSA TLE pipe analysis lost writer endpoint");
     auto record = [&](Operation *op) -> LogicalResult {
       if (!seen.insert(op).second)
         return success();
@@ -1027,7 +1060,7 @@ private:
       auto placement = getEndpointPlacement(op);
       if (failed(placement))
         return failure();
-      if (!samePlacement(state.endpoints.front(), *placement))
+      if (!samePlacement(*writerEndpoint, *placement))
         return op->emitOpError("pipe payload must be published in its writer "
                                "partition");
       PipeCoveredRegion region{field->index, root, std::nullopt, std::nullopt,
@@ -1125,6 +1158,11 @@ private:
     for (auto &owned : result->pipes) {
       PipeState &state = *owned;
       for (PipeWriterCommitOp commit : state.commits) {
+        const PipeEndpointState *writerEndpoint = result->lookupEndpoint(commit);
+        if (!writerEndpoint ||
+            writerEndpoint->role != PipeEndpointRole::Writer)
+          return commit.emitOpError(
+              "internal MUSA TLE pipe analysis lost writer endpoint");
         auto group = std::make_unique<PipeCommitGroup>();
         group->commit = commit;
         group->stage = commit.getStage();
@@ -1143,13 +1181,13 @@ private:
           if (source.kind == PipeTransportKind::TME)
             group->tmeGroupArrivalCount = 1;
           else
-            group->localStoreArrivalCount = state.endpoints.front().warpCount;
+            group->localStoreArrivalCount = writerEndpoint->warpCount;
         }
         group->totalTransactionBytes = bytes;
         // Empty/unknown synchronous effects still have a well-defined ready
         // edge. Publishing does not imply initializing the entire payload.
         if (group->completionSources.empty())
-          group->localStoreArrivalCount = state.endpoints.front().warpCount;
+          group->localStoreArrivalCount = writerEndpoint->warpCount;
         result->commitGroupByOperation[commit] = group.get();
         state.commitGroups.push_back(std::move(group));
       }
@@ -1305,10 +1343,21 @@ private:
       if (oneShot && !state.closes.empty())
         return state.create.emitOpError(
             "MUSA TLE one-shot pipe does not support writer.close");
-      if (state.endpoints.size() < 2 ||
+      unsigned writerCount = static_cast<unsigned>(llvm::count_if(
+          state.endpoints, [](const PipeEndpointState &endpoint) {
+            return endpoint.role == PipeEndpointRole::Writer;
+          }));
+      unsigned readerCount = static_cast<unsigned>(llvm::count_if(
+          state.endpoints, [](const PipeEndpointState &endpoint) {
+            return endpoint.role == PipeEndpointRole::Reader;
+          }));
+      if (writerCount == 0 || readerCount == 0 ||
           (state.commits.empty() && state.closes.empty()))
         return state.create.emitOpError("pipe requires a writer publication "
                                         "and a reader endpoint");
+      if (writerCount > 1 && !state.closes.empty())
+        return state.create.emitOpError(
+            "multi-writer MUSA TLE pipes do not yet support writer.close");
       if (state.staticWarpSpecialize) {
         int32_t totalWarps =
             module->getAttrOfType<IntegerAttr>(ttg::AttrNumWarpsName).getInt();
@@ -1340,12 +1389,22 @@ private:
       }
       int32_t tmeArrivals = 0;
       int32_t localArrivals = 0;
+      llvm::DenseMap<unsigned, int32_t> tmeArrivalsByWriter;
+      llvm::DenseMap<unsigned, int32_t> localArrivalsByWriter;
       Value external;
       bool internalTME = false;
       for (auto &group : state.commitGroups) {
-        tmeArrivals = std::max(tmeArrivals, group->tmeGroupArrivalCount);
-        if (group->localStoreArrivalCount)
-          localArrivals = state.endpoints.front().warpCount;
+        const PipeEndpointState *writerEndpoint =
+            result->lookupEndpoint(group->commit);
+        if (!writerEndpoint ||
+            writerEndpoint->role != PipeEndpointRole::Writer)
+          return group->commit.emitOpError(
+              "internal MUSA TLE pipe analysis lost writer endpoint");
+        int32_t &writerTME = tmeArrivalsByWriter[writerEndpoint->index];
+        writerTME = std::max(writerTME, group->tmeGroupArrivalCount);
+        int32_t &writerLocal =
+            localArrivalsByWriter[writerEndpoint->index];
+        writerLocal = std::max(writerLocal, group->localStoreArrivalCount);
         for (const auto &source : group->completionSources) {
           if (source.kind != PipeTransportKind::TME)
             continue;
@@ -1359,17 +1418,35 @@ private:
           }
         }
       }
+      for (const PipeEndpointState &endpoint : state.endpoints) {
+        if (endpoint.role != PipeEndpointRole::Writer)
+          continue;
+        tmeArrivals += tmeArrivalsByWriter.lookup(endpoint.index);
+        localArrivals += localArrivalsByWriter.lookup(endpoint.index);
+      }
       if (!tmeArrivals && !localArrivals)
         tmeArrivals = 1; // close-only control publication
       if (external && internalTME)
         return state.create.emitOpError("external completion barrier must be "
                                         "bound to every TME source");
+      if (external && writerCount > 1)
+        return state.create.emitOpError(
+            "multi-writer MUSA TLE pipes require pipe-owned completion "
+            "barriers");
       state.barrierPlan.full.arrivalCount = tmeArrivals + localArrivals;
       // Transaction bytes are added at the actual copy, not fixed for a ring.
       state.barrierPlan.full.transactionBytes = 0;
       for (auto &group : state.commitGroups) {
-        group->tmeGroupArrivalCount = tmeArrivals;
-        group->localStoreArrivalCount = localArrivals;
+        // The single-writer implementation historically normalized every
+        // syntactic commit path to the pipe-wide transport signature.  Keep
+        // that behavior for compatibility.  With multiple writers, each
+        // commit must publish only its own endpoint contribution; otherwise
+        // a TME-only writer would spuriously perform the local-store arrival
+        // owned by a different writer (and vice versa).
+        if (writerCount == 1) {
+          group->tmeGroupArrivalCount = tmeArrivals;
+          group->localStoreArrivalCount = localArrivals;
+        }
         group->fullArrivalCount = tmeArrivals + localArrivals;
         group->externalBarrierRoot = external;
       }
@@ -1407,8 +1484,14 @@ private:
         PipeBarrierParticipant participant{
             endpoint.index, endpoint.partitionIndex, endpoint.partition,
             endpoint.warpBegin, endpoint.warpCount};
-        if (endpoint.role == PipeEndpointRole::Writer)
-          state.barrierPlan.writerParticipant = participant;
+        if (endpoint.role == PipeEndpointRole::Writer) {
+          // Cyclic multi-writer pipes lower acquire/commit from each
+          // operation's own placement.  Keep the first participant only for
+          // legacy close-tag initialization, which multi-writer mode rejects
+          // above.
+          if (!state.barrierPlan.writerParticipant)
+            state.barrierPlan.writerParticipant = participant;
+        }
         else {
           state.barrierPlan.readerParticipants.push_back(participant);
           for (unsigned field : endpoint.subscribedFields)
