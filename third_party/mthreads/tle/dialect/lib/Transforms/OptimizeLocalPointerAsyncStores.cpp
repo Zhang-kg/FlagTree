@@ -314,7 +314,12 @@ class OptimizeLocalPointerAsyncStoresPass
         current = cvt.getSrc();
         cvt.erase();
       }
-      load.erase();
+      // The store value may reach this load through a convert-layout chain
+      // that is also consumed elsewhere.  Replacing this store removes only
+      // one branch of that chain, so erase the load only when the remaining
+      // wrappers no longer keep it live.
+      if (load->use_empty())
+        load.erase();
     }
   }
 };
