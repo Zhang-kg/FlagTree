@@ -35,6 +35,7 @@ static constexpr StringLiteral kStaticWarpSpecializeAttr =
 static constexpr StringLiteral kLocalSyncIntrinsic = "llvm.musa.syncthreads.lm";
 static constexpr StringLiteral kBarRecordIntrinsic =
     "llvm.musa.async.bar.record";
+static constexpr StringLiteral kCTAMembarIntrinsic = "llvm.musa.membar.cta";
 
 struct PartitionSync {
   LLVM::CallIntrinsicOp op;
@@ -134,6 +135,12 @@ static LogicalResult lowerWarpGroupBarriers(LLVM::LLVMFuncOp func,
     Value id = barrierIds.lookup(sync.partition);
     // A partition reuses this resource at every rendezvous. Use the phase
     // returned by arrival, not a fixed phase that only works on the first use.
+    // Publish all shared-memory writes performed by this thread before its
+    // hardware-barrier arrival.  This is a fence, not a CTA rendezvous, so it
+    // preserves independent progress among static WS partitions.
+    LLVM::CallIntrinsicOp::create(
+        rewriter, sync.op.getLoc(),
+        rewriter.getStringAttr(kCTAMembarIntrinsic), ValueRange{});
     Value arrived =
         LLVM::CallIntrinsicOp::create(
             rewriter, sync.op.getLoc(), rewriter.getI32Type(),
@@ -143,6 +150,11 @@ static LogicalResult lowerWarpGroupBarriers(LLVM::LLVMFuncOp func,
         rewriter, sync.op.getLoc(),
         rewriter.getStringAttr("llvm.musa.async.wait"),
         ValueRange{id, arrived});
+    // Acquire shared-memory visibility after the corresponding phase has
+    // completed and before the partition resumes payload accesses.
+    LLVM::CallIntrinsicOp::create(
+        rewriter, sync.op.getLoc(),
+        rewriter.getStringAttr(kCTAMembarIntrinsic), ValueRange{});
     rewriter.eraseOp(sync.op);
   }
 
