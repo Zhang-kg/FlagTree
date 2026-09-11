@@ -23,4 +23,6 @@ TLE_SUPPORTED_PRIMITIVES = [
     "gpu.barrier_wait",
     "gpu.wgmma",
     "gpu.wgmma_wait",
+    "gpu.buffered_tensor.slot",
+    "gpu.buffered_tensor.subslice",
 ]
