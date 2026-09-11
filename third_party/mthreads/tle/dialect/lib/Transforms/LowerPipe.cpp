@@ -416,9 +416,10 @@ class LowerPipePass
       if (*plan.full.transactionBytes > 0)
         bytes = builder.getI32IntegerAttr(*plan.full.transactionBytes);
       Value fullBase;
-      SmallVector<Value> privateFullBaseByEndpoint(state->endpoints.size());
+      SmallVector<Value> privateFullBaseByEndpoint;
       SmallVector<Value> readerFullBases;
       if (hasWriterPrivateFull) {
+        privateFullBaseByEndpoint.resize(state->endpoints.size());
         for (const musa_tle::PipeWriterFullBarrierPlan &writerPlan :
              plan.writerFull) {
           if (writerPlan.endpointIndex >= state->endpoints.size() ||
