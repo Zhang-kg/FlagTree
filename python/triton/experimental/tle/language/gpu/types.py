@@ -586,6 +586,56 @@ class buffered_tensor(tl.base_value):
                                alloc_shape=slot_ty.alloc_shape)
 
     @tl.builtin
+    def subslice(self, start, length, dim=-1, _semantic: TLESemantic | None = None):
+        """Return a rank-preserving aliasing view of a static SMEM slice."""
+        start = tl._unwrap_if_constexpr(start)
+        length = tl._unwrap_if_constexpr(length)
+        dim = tl._unwrap_if_constexpr(dim)
+        if not isinstance(start, int):
+            raise TypeError(f"buffered_tensor.subslice start must be a compile-time int, got {start}")
+        if not isinstance(length, int):
+            raise TypeError(f"buffered_tensor.subslice length must be a compile-time int, got {length}")
+        if not isinstance(dim, int):
+            raise TypeError(f"buffered_tensor.subslice dim must be a compile-time int, got {dim}")
+
+        rank = len(self.shape)
+        if dim < 0:
+            dim += rank
+        if dim < 0 or dim >= rank:
+            raise IndexError(f"buffered_tensor.subslice dim {dim} is out of range for rank {rank}")
+        if start < 0 or length <= 0 or start + length > self.shape[dim]:
+            raise ValueError(
+                "buffered_tensor.subslice requires "
+                f"0 <= start < start + length <= {self.shape[dim]}, "
+                f"got start={start}, length={length}, dim={dim}"
+            )
+
+        shape = list(self.shape)
+        shape[dim] = length
+        offsets = [0] * rank
+        offsets[dim] = start
+        sub_ty = buffered_tensor_type(
+            self.dtype,
+            shape,
+            self.type.storage,
+            self.type.layout,
+            _semantic,
+            alloc_shape=self.type.alloc_shape,
+        )
+        handle = _semantic.builder.create_memdesc_subslice(
+            sub_ty.to_ir(_semantic.builder), self.handle, offsets
+        )
+        return buffered_tensor(
+            handle,
+            self.dtype,
+            shape,
+            self.type.storage,
+            self.type.layout,
+            _semantic,
+            alloc_shape=sub_ty.alloc_shape,
+        )
+
+    @tl.builtin
     def reshape(self, shape, _semantic=None):
         """Return an aliasing shared-memory view with a different static shape."""
         shape = [int(tl._unwrap_if_constexpr(dim)) for dim in tl._unwrap_if_constexpr(shape)]
