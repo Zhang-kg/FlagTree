@@ -913,7 +913,11 @@ class MUSABackend(BaseBackend):
 
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
-        requires_tail_fallback = capability >= 31 and mthreads.requires_tme_tail_pointer_fallback(mod)
+        # Keep TME only when every descriptor proves the native tail contract;
+        # missing or weaker (for example, T2) divisibility must take the fallback.
+        requires_tail_fallback = (
+            capability >= 31 and mthreads.requires_tme_tail_pointer_fallback(mod)
+        )
         if _module_requires_descriptor_pointer_fallback(mod, capability) or requires_tail_fallback:
             passes.ttir.add_rewrite_tensor_descriptor_to_pointer(pm)
         passes.common.add_canonicalizer(pm)
