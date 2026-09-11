@@ -683,8 +683,13 @@ template <class Op> struct GenericOpPattern : public OpConversionPattern<Op> {
   matchAndRewrite(Op op, typename Op::Adaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     SmallVector<Type> retTypes;
+#ifdef __TLE__
+    if (failed(this->getTypeConverter()->convertTypes(op->getResults(),
+                                                      retTypes)))
+#else
     if (failed(this->getTypeConverter()->convertTypes(op->getResultTypes(),
                                                       retTypes)))
+#endif
       return failure();
     rewriter.replaceOpWithNewOp<Op>(op, retTypes, adaptor.getOperands(),
                                     op->getAttrs());
@@ -700,7 +705,12 @@ public:
   LogicalResult
   matchAndRewrite(arith::ConstantOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    Type retType = getTypeConverter()->convertType(op.getType());
+    Type retType =
+#ifdef __TLE__
+        getTypeConverter()->convertType(op.getResult());
+#else
+        getTypeConverter()->convertType(op.getType());
+#endif
     auto retShapedType = cast<ShapedType>(retType);
     auto value = dyn_cast<DenseElementsAttr>(adaptor.getValue());
     if (isa<RankedTensorType>(retShapedType)) {
@@ -967,7 +977,11 @@ struct TritonCatPattern : public OpConversionPattern<triton::CatOp> {
     // For now, this behaves like generic, but this
     // will evolve when we add support for `can_reorder=False`.
     auto retType = cast<RankedTensorType>(
+#ifdef __TLE__
+        this->getTypeConverter()->convertType(op.getResult()));
+#else
         this->getTypeConverter()->convertType(op.getType()));
+#endif
     auto retEncoding =
         cast<triton::gpu::BlockedEncodingAttr>(retType.getEncoding());
     auto lhsType = adaptor.getLhs().getType();
@@ -1159,7 +1173,11 @@ struct TritonMapElementwisePattern
                   ConversionPatternRewriter &rewriter) const override {
     auto converter = getTypeConverter();
     SmallVector<Type> resultTys;
+#ifdef __TLE__
+    auto err = converter->convertTypes(op.getResults(), resultTys);
+#else
     auto err = converter->convertTypes(op.getResults().getType(), resultTys);
+#endif
     if (failed(err)) {
       return err;
     }
@@ -1316,8 +1334,13 @@ struct SCFForPattern : public OpConversionPattern<scf::ForOp> {
     newOp->setOperands(adaptor.getOperands());
     // Update the result types to the new converted types.
     SmallVector<Type> newResultTypes;
+#ifdef __TLE__
+    for (Value result : op.getResults()) {
+      Type newType = typeConverter->convertType(result);
+#else
     for (Type type : op.getResultTypes()) {
       Type newType = typeConverter->convertType(type);
+#endif
       if (!newType)
         return rewriter.notifyMatchFailure(op, "not a 1:1 type conversion");
       newResultTypes.push_back(newType);
@@ -1350,8 +1373,13 @@ public:
     // wrong type on the SSA values! These edge cases are also why we cannot
     // safely use the TypeConverter::convertTypes helper here.
     SmallVector<Type> newResultTypes;
+#ifdef __TLE__
+    for (Value result : op.getResults()) {
+      Type newType = typeConverter->convertType(result);
+#else
     for (auto type : op.getResultTypes()) {
       Type newType = typeConverter->convertType(type);
+#endif
       if (!newType)
         return rewriter.notifyMatchFailure(op, "not a 1:1 type conversion");
       newResultTypes.push_back(newType);
@@ -1387,7 +1415,11 @@ public:
     auto *converter = getTypeConverter();
     assert(converter);
     SmallVector<Type> newResultTypes;
+#ifdef __TLE__
+    if (failed(converter->convertTypes(op.getResults(), newResultTypes)))
+#else
     if (failed(converter->convertTypes(op.getResultTypes(), newResultTypes)))
+#endif
       return failure();
 
     auto newOp = scf::WhileOp::create(rewriter, op.getLoc(), newResultTypes,
@@ -1560,6 +1592,91 @@ void populateMUSATlePatterns(TritonGPUTypeConverter &typeConverter,
                MUSATLEExtractTilePattern, MUSATLEInsertTilePattern>(
       typeConverter, context);
 }
+
+// Triton places tensor constants that originate in inlined role functions in
+// the enclosing function entry block.  A single such value cannot have both
+// the default partition's 4-warp encoding and a worker partition's 2/1-warp
+// encoding.  Rematerialize tensor constants in each worker before type
+// conversion so contextual value conversion can select that partition's
+// layout.  Scalars remain shared captures because they have no layout.
+static void rematerializeStaticWsTensorConstants(ModuleOp mod,
+                                                 int defaultNumWarps) {
+  SmallVector<triton::gpu::WarpSpecializeOp> warpSpecializeOps;
+  mod.walk([&](triton::gpu::WarpSpecializeOp ws) {
+    warpSpecializeOps.push_back(ws);
+  });
+
+  IRRewriter rewriter(mod.getContext());
+  for (triton::gpu::WarpSpecializeOp ws : warpSpecializeOps) {
+    for (Region *partition : ws.getPartitionRegions()) {
+      // The two math partitions use the module-default width and retain the
+      // original SQMMA layout-inference path unchanged.  Only narrower roles
+      // need private copies to avoid sharing a 4-warp constant capture.
+      if (lookupNumWarps(partition) == defaultNumWarps)
+        continue;
+      SmallVector<std::pair<OpOperand *, arith::ConstantOp>> externalUses;
+      partition->walk([&](Operation *op) {
+        for (OpOperand &operand : op->getOpOperands()) {
+          auto constant = operand.get().getDefiningOp<arith::ConstantOp>();
+          if (!constant ||
+              !isa<RankedTensorType>(constant.getResult().getType()) ||
+              partition->isAncestor(constant->getParentRegion()))
+            continue;
+          externalUses.emplace_back(&operand, constant);
+        }
+      });
+
+      DenseMap<Operation *, Value> clones;
+      rewriter.setInsertionPointToStart(&partition->front());
+      for (auto [operand, constant] : externalUses) {
+        Value clone;
+        auto found = clones.find(constant.getOperation());
+        if (found == clones.end()) {
+          IRMapping mapping;
+          Operation *cloned = rewriter.clone(*constant.getOperation(), mapping);
+          clone = cloned->getResult(0);
+          clones[constant.getOperation()] = clone;
+        } else {
+          clone = found->second;
+        }
+        operand->set(clone);
+      }
+    }
+  }
+}
+
+// MLIR's generic region-signature conversion still reaches the Type-only
+// callback for loop-carried block arguments.  Give just those arguments the
+// owning partition's width up front.  Operation results remain unencoded so
+// specialized patterns can derive Slice/Blocked relationships normally.
+static void preencodeNarrowStaticWsBlockArguments(ModuleOp mod,
+                                                  int defaultNumWarps,
+                                                  int threadsPerWarp,
+                                                  int numCTAs) {
+  mod.walk([&](triton::gpu::WarpSpecializeOp ws) {
+    for (Region *partition : ws.getPartitionRegions()) {
+      const int roleNumWarps = lookupNumWarps(partition);
+      if (roleNumWarps == defaultNumWarps)
+        continue;
+      partition->walk([&](Operation *op) {
+        for (Region &region : op->getRegions()) {
+          for (Block &block : region) {
+            for (BlockArgument argument : block.getArguments()) {
+              auto type = dyn_cast<RankedTensorType>(argument.getType());
+              if (!type || type.getEncoding())
+                continue;
+              auto encoding = getDefaultBlockedEncoding(
+                  mod.getContext(), type.getShape(), roleNumWarps,
+                  threadsPerWarp, numCTAs);
+              argument.setType(type.cloneWithEncoding(encoding));
+            }
+          }
+        }
+      });
+    }
+  });
+}
+
 #endif // __TLE__
 
 class ConvertTritonToTritonGPU
@@ -1578,6 +1695,11 @@ public:
 
     MLIRContext *context = &getContext();
     ModuleOp mod = getOperation();
+#ifdef __TLE__
+    rematerializeStaticWsTensorConstants(mod, numWarps);
+    preencodeNarrowStaticWsBlockArguments(mod, numWarps, threadsPerWarp,
+                                          numCTAs);
+#endif
     // type converter
     TritonGPUTypeConverter typeConverter(context, numWarps, threadsPerWarp,
                                          numCTAs, enableSourceRemat);
