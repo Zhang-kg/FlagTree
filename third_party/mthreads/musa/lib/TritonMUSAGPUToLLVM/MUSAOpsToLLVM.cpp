@@ -195,6 +195,25 @@ std::optional<int64_t> inferElemBytesFromMemDesc(Type type) {
 }
 
 #ifdef __TLE__
+// `getThreadId` intentionally returns a partition-relative, power-of-two
+// masked thread id while lowering static warp specialization.  That is the
+// right coordinate for per-partition work, but it must not be used to elect a
+// unique CTA-wide owner for hardware barrier initialization: physical threads
+// 0, 128, 256, ... can all look like relative thread 0.  Read the physical
+// CTA x thread id directly for CTA-wide ownership instead.
+Value getPhysicalCTAThreadId(Location loc,
+                             ConversionPatternRewriter &rewriter) {
+  Value threadId = ::mlir::gpu::ThreadIdOp::create(
+      rewriter, loc, ::mlir::gpu::Dimension::x);
+  return arith::IndexCastOp::create(rewriter, loc, i32_ty, threadId);
+}
+
+Value buildPhysicalCTAThreadZeroPredicate(
+    Location loc, ConversionPatternRewriter &rewriter) {
+  auto b = TritonLLVMOpBuilder(loc, rewriter);
+  return b.icmp_eq(getPhysicalCTAThreadId(loc, rewriter), b.i32_val(0));
+}
+
 Value buildTMEIssuePredicate(Value userPred, Location loc,
                              ConversionPatternRewriter &rewriter,
                              Operation *issueOp = nullptr) {
@@ -210,9 +229,7 @@ Value buildTMEIssuePredicate(Value userPred, Location loc,
   }
   Value threadId;
   if (hasExplicitIssueThread) {
-    threadId = ::mlir::gpu::ThreadIdOp::create(rewriter, loc,
-                                               ::mlir::gpu::Dimension::x);
-    threadId = arith::IndexCastOp::create(rewriter, loc, i32_ty, threadId);
+    threadId = getPhysicalCTAThreadId(loc, rewriter);
   } else {
     threadId = getThreadId(rewriter, loc);
   }
@@ -235,9 +252,15 @@ Value buildTMEIssueOnlyPredicate(Location loc,
   return buildTMEIssuePredicate(truePred, loc, rewriter);
 }
 
+void emitCTAMembar(ConversionPatternRewriter &rewriter, Location loc) {
+  LLVM::createLLVMIntrinsicCallOp(rewriter, loc, "llvm.musa.membar.cta",
+                                  TypeRange{}, {});
+}
+
 void emitPredicatedVoidIntrinsic(ConversionPatternRewriter &rewriter,
                                  Location loc, Value pred, StringRef intrinsic,
-                                 ArrayRef<Value> operands) {
+                                 ArrayRef<Value> operands,
+                                 bool ctaMembarBefore = false) {
   Block *currentBlock = rewriter.getInsertionBlock();
   Block *afterCall =
       rewriter.splitBlock(currentBlock, rewriter.getInsertionPoint());
@@ -245,6 +268,8 @@ void emitPredicatedVoidIntrinsic(ConversionPatternRewriter &rewriter,
   rewriter.setInsertionPointToEnd(currentBlock);
   LLVM::CondBrOp::create(rewriter, loc, pred, trueBlock, afterCall);
   rewriter.setInsertionPointToStart(trueBlock);
+  if (ctaMembarBefore)
+    emitCTAMembar(rewriter, loc);
   LLVM::createLLVMIntrinsicCallOp(rewriter, loc, intrinsic, TypeRange{},
                                   operands);
   LLVM::BrOp::create(rewriter, loc, afterCall);
@@ -513,7 +538,13 @@ struct InitArrivalOpConversion
                           .i32_val(static_cast<int32_t>(*numWarps));
     }
 
+#ifdef __TLE__
+    // Barrier resources are CTA-wide.  Initialize each one exactly once even
+    // when the init lives outside several static warp-specialized partitions.
+    Value launchPred = buildPhysicalCTAThreadZeroPredicate(loc, rewriter);
+#else
     Value launchPred = buildTMEIssueOnlyPredicate(loc, rewriter);
+#endif // __TLE__
     SmallVector<Value> operands = {adaptor.getBarId(), arriveCount,
                                    adaptor.getPhaseId()};
     emitPredicatedVoidIntrinsic(rewriter, loc, launchPred,
@@ -554,6 +585,9 @@ struct ArriveBarrierOpConversion
   LogicalResult
   matchAndRewrite(triton::musa::ArriveBarrierOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+#ifdef __TLE__
+    emitCTAMembar(rewriter, op.getLoc());
+#endif // __TLE__
     SmallVector<Value> operands = {adaptor.getBarId()};
     auto call = LLVM::createLLVMIntrinsicCallOp(
         rewriter, op.getLoc(), "llvm.musa.async.arrive",
@@ -579,9 +613,15 @@ struct ArriveBarrierNoRetOpConversion
     Value launchPred = buildTMEIssuePredicate(adaptor.getPred(), loc, rewriter);
 #endif // __TLE__
     SmallVector<Value> operands = {adaptor.getBarId()};
+#ifdef __TLE__
+    emitPredicatedVoidIntrinsic(rewriter, loc, launchPred,
+                                "llvm.musa.async.arrive.none.phaseid",
+                                operands, /*ctaMembarBefore=*/true);
+#else
     emitPredicatedVoidIntrinsic(rewriter, loc, launchPred,
                                 "llvm.musa.async.arrive.none.phaseid",
                                 operands);
+#endif // __TLE__
     rewriter.eraseOp(op);
     return success();
   }
@@ -596,6 +636,7 @@ struct WarpArriveBarrierOpConversion
   LogicalResult
   matchAndRewrite(triton::musa::WarpArriveBarrierOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    emitCTAMembar(rewriter, op.getLoc());
     SmallVector<Value> operands = {adaptor.getBarId()};
     LLVM::createLLVMIntrinsicCallOp(rewriter, op.getLoc(),
                                     "llvm.musa.async.arrive.none.phaseid",
@@ -617,6 +658,9 @@ struct WaitBarrierOpConversion
     SmallVector<Value> operands = {adaptor.getBarId(), adaptor.getPhaseId()};
     LLVM::createLLVMIntrinsicCallOp(
         rewriter, op.getLoc(), "llvm.musa.async.wait", TypeRange{}, operands);
+#ifdef __TLE__
+    emitCTAMembar(rewriter, op.getLoc());
+#endif // __TLE__
     rewriter.eraseOp(op);
     return success();
   }
