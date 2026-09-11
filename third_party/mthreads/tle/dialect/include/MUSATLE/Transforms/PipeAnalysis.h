@@ -158,6 +158,14 @@ struct PipeBarrierRingPlan {
   Value externalStorage;
 };
 
+// Multi-writer pipes use one completion ring per writer endpoint. This keeps
+// each writer's expect/add-transaction/complete sequence independent while
+// preserving one logical pipe and one shared empty ring.
+struct PipeWriterFullBarrierPlan {
+  unsigned endpointIndex = 0;
+  PipeBarrierRingPlan ring;
+};
+
 // The allocation and canonical base are retained in the analysis result so
 // LowerPipe can reuse a user-provided full barrier without materializing a
 // second pipe-owned ring.
@@ -200,6 +208,7 @@ struct PipeBarrierParticipant {
 
 struct PipeBarrierPlan {
   PipeBarrierRingPlan full;
+  SmallVector<PipeWriterFullBarrierPlan> writerFull;
   std::optional<PipeBarrierRingPlan> empty;
   bool hasCloseState = false;
   std::optional<PipeCloseTagPlan> closeTagPlan;

@@ -1433,6 +1433,28 @@ private:
         return state.create.emitOpError(
             "multi-writer MUSA TLE pipes require pipe-owned completion "
             "barriers");
+      // Keep single-writer behavior unchanged. In multi-writer mode, isolate
+      // the transaction/full ring of each writer endpoint. A reader will wait
+      // on every writer ring before observing the logical pipe payload.
+      state.barrierPlan.writerFull.clear();
+      if (writerCount > 1) {
+        for (const PipeEndpointState &endpoint : state.endpoints) {
+          if (endpoint.role != PipeEndpointRole::Writer)
+            continue;
+          int32_t arrivals =
+              tmeArrivalsByWriter.lookup(endpoint.index) +
+              localArrivalsByWriter.lookup(endpoint.index);
+          if (arrivals <= 0)
+            return state.create.emitOpError(
+                "multi-writer MUSA TLE pipe writer has no completion "
+                "contribution");
+          state.barrierPlan.writerFull.push_back(PipeWriterFullBarrierPlan{
+              endpoint.index,
+              PipeBarrierRingPlan{state.capacity, arrivals,
+                                  PipeBarrierInitialState::Pending, 0,
+                                  PipeBarrierStorageOwner::Pipe, Value()}});
+        }
+      }
       state.barrierPlan.full.arrivalCount = tmeArrivals + localArrivals;
       // Transaction bytes are added at the actual copy, not fixed for a ring.
       state.barrierPlan.full.transactionBytes = 0;
@@ -1447,7 +1469,16 @@ private:
           group->tmeGroupArrivalCount = tmeArrivals;
           group->localStoreArrivalCount = localArrivals;
         }
-        group->fullArrivalCount = tmeArrivals + localArrivals;
+        const PipeEndpointState *writerEndpoint =
+            result->lookupEndpoint(group->commit);
+        if (!writerEndpoint)
+          return group->commit.emitOpError(
+              "internal MUSA TLE pipe analysis lost writer endpoint");
+        group->fullArrivalCount =
+            writerCount == 1
+                ? tmeArrivals + localArrivals
+                : tmeArrivalsByWriter.lookup(writerEndpoint->index) +
+                      localArrivalsByWriter.lookup(writerEndpoint->index);
         group->externalBarrierRoot = external;
       }
       if (external) {

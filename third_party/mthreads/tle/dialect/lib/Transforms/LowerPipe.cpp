@@ -87,6 +87,10 @@ static Value captureForUse(Operation *use, Value value) {
 
 struct PipeLoweringArtifacts {
   Value fullBase;
+  // Empty when the legacy single full ring is used. Multi-writer pipes keep
+  // one full-ring base per writer endpoint and a stable reader wait order.
+  SmallVector<Value> privateFullBaseByEndpoint;
+  SmallVector<Value> readerFullBases;
   Value emptyBase;
   Value closeTags;
   ttg::MemDescType closeTagSlotType;
@@ -106,6 +110,26 @@ static bool sameParticipant(const musa_tle::PipeBarrierParticipant &lhs,
          lhs.partitionIndex == rhs.partitionIndex &&
          lhs.partition == rhs.partition && lhs.warpBegin == rhs.warpBegin &&
          lhs.warpCount == rhs.warpCount;
+}
+
+static FailureOr<Value> getWriterFullBase(
+    const PipeLoweringArtifacts &artifacts,
+    const musa_tle::PipeEndpointState *endpoint, Operation *operation) {
+  if (!endpoint || endpoint->role != musa_tle::PipeEndpointRole::Writer)
+    return operation->emitOpError(
+        "internal MUSA TLE pipe lowering lost writer endpoint");
+  if (artifacts.privateFullBaseByEndpoint.empty()) {
+    if (!artifacts.fullBase)
+      return operation->emitOpError(
+          "internal MUSA TLE pipe lowering lost full barrier ring");
+    return artifacts.fullBase;
+  }
+  if (endpoint->index >= artifacts.privateFullBaseByEndpoint.size() ||
+      !artifacts.privateFullBaseByEndpoint[endpoint->index])
+    return operation->emitOpError(
+        "internal MUSA TLE pipe lowering lost writer-private full barrier "
+        "ring");
+  return artifacts.privateFullBaseByEndpoint[endpoint->index];
 }
 
 static FailureOr<musa_tle::PipeBarrierParticipant> getReaderBarrierParticipant(
@@ -353,6 +377,23 @@ class LowerPipePass
       const musa_tle::PipeBarrierPlan &plan = state->barrierPlan;
       bool oneShot =
           state->lifecycle.mode == musa_tle::PipeLifecycleMode::OneShot;
+      bool hasWriterPrivateFull = !plan.writerFull.empty();
+      if (hasWriterPrivateFull) {
+        if (plan.writerFull.size() < 2 || plan.externalFull ||
+            plan.full.externalStorage ||
+            plan.full.storageOwner !=
+                musa_tle::PipeBarrierStorageOwner::Pipe)
+          return create.emitOpError(
+              "internal MUSA TLE pipe lowering requires valid "
+              "writer-private full barrier plans");
+        llvm::DenseSet<unsigned> endpoints;
+        for (const musa_tle::PipeWriterFullBarrierPlan &writerPlan :
+             plan.writerFull)
+          if (!endpoints.insert(writerPlan.endpointIndex).second)
+            return create.emitOpError(
+                "internal MUSA TLE pipe lowering received duplicate "
+                "writer-private full barrier plans");
+      }
       if ((!plan.full.transactionBytes && !plan.closeTagPlan) ||
           (oneShot ? plan.empty.has_value() : !plan.empty.has_value()) ||
           (!oneShot && plan.empty->storageOwner !=
@@ -375,14 +416,47 @@ class LowerPipePass
       if (*plan.full.transactionBytes > 0)
         bytes = builder.getI32IntegerAttr(*plan.full.transactionBytes);
       Value fullBase;
-      if (plan.full.storageOwner ==
-          musa_tle::PipeBarrierStorageOwner::External) {
-        fullBase = plan.full.externalStorage;
+      SmallVector<Value> privateFullBaseByEndpoint(state->endpoints.size());
+      SmallVector<Value> readerFullBases;
+      if (hasWriterPrivateFull) {
+        for (const musa_tle::PipeWriterFullBarrierPlan &writerPlan :
+             plan.writerFull) {
+          if (writerPlan.endpointIndex >= state->endpoints.size() ||
+              state->endpoints[writerPlan.endpointIndex].role !=
+                  musa_tle::PipeEndpointRole::Writer ||
+              writerPlan.ring.capacity != state->capacity ||
+              writerPlan.ring.arrivalCount <= 0 ||
+              writerPlan.ring.initialState !=
+                  musa_tle::PipeBarrierInitialState::Pending ||
+              !writerPlan.ring.transactionBytes ||
+              *writerPlan.ring.transactionBytes != 0 ||
+              writerPlan.ring.storageOwner !=
+                  musa_tle::PipeBarrierStorageOwner::Pipe ||
+              writerPlan.ring.externalStorage)
+            return create.emitOpError(
+                "internal MUSA TLE pipe lowering received an invalid "
+                "writer-private full barrier plan");
+          Value base = musa_tle::BarrierAllocOp::create(
+              builder, loc,
+              builder.getI32IntegerAttr(writerPlan.ring.capacity),
+              builder.getI32IntegerAttr(writerPlan.ring.arrivalCount),
+              pending, IntegerAttr());
+          base.getDefiningOp()->setAttr(kPipeBarrierRingAttr,
+                                        builder.getUnitAttr());
+          privateFullBaseByEndpoint[writerPlan.endpointIndex] = base;
+          readerFullBases.push_back(base);
+        }
       } else {
-        fullBase = musa_tle::BarrierAllocOp::create(
-            builder, loc, capacity, fullArrivals, pending, bytes);
-        fullBase.getDefiningOp()->setAttr(kPipeBarrierRingAttr,
-                                          builder.getUnitAttr());
+        if (plan.full.storageOwner ==
+            musa_tle::PipeBarrierStorageOwner::External) {
+          fullBase = plan.full.externalStorage;
+        } else {
+          fullBase = musa_tle::BarrierAllocOp::create(
+              builder, loc, capacity, fullArrivals, pending, bytes);
+          fullBase.getDefiningOp()->setAttr(kPipeBarrierRingAttr,
+                                            builder.getUnitAttr());
+        }
+        readerFullBases.push_back(fullBase);
       }
       Value emptyBase;
       if (plan.empty) {
@@ -476,6 +550,9 @@ class LowerPipePass
 
       PipeLoweringArtifacts pipeArtifacts;
       pipeArtifacts.fullBase = fullBase;
+      pipeArtifacts.privateFullBaseByEndpoint =
+          std::move(privateFullBaseByEndpoint);
+      pipeArtifacts.readerFullBases = std::move(readerFullBases);
       pipeArtifacts.emptyBase = emptyBase;
       pipeArtifacts.closeTags = closeTags;
       pipeArtifacts.closeTagSlotType = closeTagSlotType;
@@ -576,6 +653,11 @@ class LowerPipePass
         if (!group)
           return commit.emitOpError("lost the analyzed pipe completion group");
 
+        FailureOr<Value> writerFullBase = getWriterFullBase(
+            pipeArtifacts, analysis.lookupEndpoint(commit), commit);
+        if (failed(writerFullBase))
+          return failure();
+
         bool hasAsync =
             llvm::any_of(group->completionSources, [](auto &source) {
               return source.kind == musa_tle::PipeTransportKind::AsyncCopy;
@@ -657,7 +739,7 @@ class LowerPipePass
           auto *first = tmeSources.front();
           OpBuilder firstBuilder(first->operation);
           commonBarrier = createIndex(firstBuilder, first->operation->getLoc(),
-                                      first->operation, pipeArtifacts.fullBase,
+                                      first->operation, *writerFullBase,
                                       first->stage);
         }
         for (const auto &source : group->completionSources) {
@@ -669,7 +751,7 @@ class LowerPipePass
           Value barrier =
               commonBarrier ? commonBarrier
                             : createIndex(copyBuilder, copy.getLoc(), copy,
-                                          pipeArtifacts.fullBase, source.stage);
+                                          *writerFullBase, source.stage);
           auto replacement =
               ttg::TMACopyOp::create(copyBuilder, copy.getLoc(), copy.getSrc(),
                                      copy.getDst(), copy.getIndices(), barrier);
@@ -690,7 +772,7 @@ class LowerPipePass
           copy.erase();
         }
         if (group->tmeGroupArrivalCount) {
-          Value barrier = createIndex(builder, loc, op, pipeArtifacts.fullBase,
+          Value barrier = createIndex(builder, loc, op, *writerFullBase,
                                       group->stage);
           Value predicate = arith::ConstantIntOp::create(builder, loc, 1, 1);
           auto arrival = ttmg::ArriveBarrierNoRetOp::create(builder, loc,
@@ -704,7 +786,7 @@ class LowerPipePass
                            builder.getUnitAttr());
         }
         if (group->localStoreArrivalCount)
-          lowerLocalStoreArrival(builder, loc, op, pipeArtifacts.fullBase,
+          lowerLocalStoreArrival(builder, loc, op, *writerFullBase,
                                  *group);
         commit.erase();
         continue;
@@ -716,19 +798,28 @@ class LowerPipePass
                                         analysis.lookupEndpoint(wait), wait);
         if (failed(readerParticipant))
           return failure();
-        Value barrier = createIndex(builder, loc, op, pipeArtifacts.fullBase,
-                                    wait.getStage());
         Value phase =
             state->lifecycle.mode == musa_tle::PipeLifecycleMode::OneShot
                 ? arith::ConstantIntOp::create(builder, loc, 0, 32)
                 : toI32Phase(builder, loc, wait.getPhase(), false);
-        auto loweredWait =
-            musa_tle::BarrierWaitOp::create(builder, loc, barrier, phase);
+        Operation *lastLoweredWait = nullptr;
+        for (Value fullBase : pipeArtifacts.readerFullBases) {
+          Value barrier =
+              createIndex(builder, loc, op, fullBase, wait.getStage());
+          lastLoweredWait = musa_tle::BarrierWaitOp::create(
+                                builder, loc, barrier, phase)
+                                .getOperation();
+        }
+        if (!lastLoweredWait)
+          return wait.emitOpError(
+              "internal MUSA TLE pipe lowering lost reader full barriers");
         FailureOr<SmallVector<int64_t>> waitGroups = getReaderLocalStoreGroups(
             pipeArtifacts, analysis.lookupEndpoint(wait), wait);
         if (failed(waitGroups))
           return failure();
-        setLocalStoreWaitGroups(loweredWait, builder, *waitGroups);
+        // Only the last wait proves that every writer has published its
+        // fields. Attach the aggregate local-store acquire edge there.
+        setLocalStoreWaitGroups(lastLoweredWait, builder, *waitGroups);
         if (const musa_tle::PipeReaderDrainGroup *drain =
                 analysis.lookupReaderDrainGroup(wait)) {
           for (const musa_tle::PipeReaderDrainSource &source :
@@ -770,7 +861,7 @@ class LowerPipePass
         if (!wait.getIsClosed().use_empty()) {
           Value isClosed;
           if (state->barrierPlan.closeTagPlan) {
-            builder.setInsertionPointAfter(loweredWait);
+            builder.setInsertionPointAfter(lastLoweredWait);
             RankedTensorType loadTensorType = getCloseTagTensorType(
                 wait, builder, {1}, readerParticipant->warpCount);
             isClosed = loadCloseTag(builder, loc, pipeArtifacts, op,
