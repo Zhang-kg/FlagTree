@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <numeric>
+#include <optional>
 
 #include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/IR/IRMapping.h"
@@ -53,6 +54,48 @@ TritonGPUTypeConverter::TritonGPUTypeConverter(MLIRContext *context,
     return triton::PointerType::get(convertedTensorType,
                                     ptrType.getAddressSpace());
   });
+
+#ifdef __TLE__
+  // A static warp-specialize partition may use a different warp count from
+  // the module's default partition.  Type-only conversion has no owning-op
+  // context and therefore assigns every unencoded tensor the default layout.
+  // Prefer a value conversion so vector values created in the 2-warp dispatch
+  // and 1-warp producer partitions receive matching blocked encodings.
+  addConversion([this](Value value) -> std::optional<Type> {
+    int valueNumWarps = this->numWarps;
+    if (auto blockArg = dyn_cast<BlockArgument>(value)) {
+      if (Block *owner = blockArg.getOwner()) {
+        if (Region *region = owner->getParent()) {
+          if (region->getParentOp())
+            valueNumWarps = lookupNumWarps(region);
+        }
+      }
+    } else if (Operation *op = value.getDefiningOp()) {
+      if (std::optional<int> contextualNumWarps = maybeLookupNumWarps(op))
+        valueNumWarps = *contextualNumWarps;
+    }
+
+    auto convertTensor = [&](RankedTensorType tensorType) {
+      if (tensorType.getEncoding())
+        return tensorType;
+      auto encoding = getDefaultBlockedEncoding(
+          this->context, tensorType.getShape(), valueNumWarps,
+          this->threadsPerWarp, this->numCTAs);
+      return tensorType.cloneWithEncoding(encoding);
+    };
+
+    Type type = value.getType();
+    if (auto tensorType = dyn_cast<RankedTensorType>(type))
+      return convertTensor(tensorType);
+    if (auto ptrType = dyn_cast<triton::PointerType>(type)) {
+      if (auto pointeeTensorType =
+              dyn_cast<RankedTensorType>(ptrType.getPointeeType()))
+        return triton::PointerType::get(convertTensor(pointeeTensorType),
+                                        ptrType.getAddressSpace());
+    }
+    return std::nullopt;
+  });
+#endif
 
   // If the origValue still has live user(s), use this to
   // convert origValue to newValue
