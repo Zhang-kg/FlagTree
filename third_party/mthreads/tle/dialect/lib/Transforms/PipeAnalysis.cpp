@@ -1459,21 +1459,29 @@ private:
       // Transaction bytes are added at the actual copy, not fixed for a ring.
       state.barrierPlan.full.transactionBytes = 0;
       for (auto &group : state.commitGroups) {
-        // The single-writer implementation historically normalized every
-        // syntactic commit path to the pipe-wide transport signature.  Keep
-        // that behavior for compatibility.  With multiple writers, each
-        // commit must publish only its own endpoint contribution; otherwise
-        // a TME-only writer would spuriously perform the local-store arrival
-        // owned by a different writer (and vice versa).
-        if (writerCount == 1) {
-          group->tmeGroupArrivalCount = tmeArrivals;
-          group->localStoreArrivalCount = localArrivals;
-        }
         const PipeEndpointState *writerEndpoint =
             result->lookupEndpoint(group->commit);
         if (!writerEndpoint)
           return group->commit.emitOpError(
               "internal MUSA TLE pipe analysis lost writer endpoint");
+        // Normalize every syntactic commit path to the completion signature
+        // of its writer endpoint.  A conditional writer may reach one commit
+        // through a TME-only path and another through a local-store-only path,
+        // but both paths reuse the same private full ring initialized with
+        // max(TME) + max(local) arrivals.  Supplying the endpoint maxima on
+        // every path prevents a generation from waiting forever for the
+        // transport contribution absent on that path.  Endpoint-local
+        // normalization is essential here: pipe-wide normalization would
+        // make one writer impersonate contributions owned by another writer.
+        if (writerCount == 1) {
+          group->tmeGroupArrivalCount = tmeArrivals;
+          group->localStoreArrivalCount = localArrivals;
+        } else {
+          group->tmeGroupArrivalCount =
+              tmeArrivalsByWriter.lookup(writerEndpoint->index);
+          group->localStoreArrivalCount =
+              localArrivalsByWriter.lookup(writerEndpoint->index);
+        }
         group->fullArrivalCount =
             writerCount == 1
                 ? tmeArrivals + localArrivals
