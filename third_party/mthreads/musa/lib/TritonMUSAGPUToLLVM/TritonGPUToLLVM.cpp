@@ -549,6 +549,10 @@ struct ConvertTritonMUSAGPUToLLVM
       mlir::triton::convertOpTypes(op, typeConverter);
 
     if (!staticWarpSpecializeOps.empty()) {
+      // LLVM conversion may introduce function-level scratch pointers in an
+      // isolated worker region. Make these new captures explicit before the
+      // nested cleanup pipeline verifies the region isolation contract.
+      mlir::makeAllWarpGroupsIsolatedFromAbove(mod);
       OpPassManager cleanup;
       cleanup.addPass(createReconcileUnrealizedCastsPass());
       if (failed(runPipeline(cleanup, mod)))

@@ -5,6 +5,7 @@
 #include "mlir/IR/DialectImplementation.h"
 #include "mlir/IR/OpImplementation.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "mlir/Transforms/InliningUtils.h"
 #include "triton/Dialect/Triton/IR/Types.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -24,7 +25,21 @@ namespace ttg = mlir::triton::gpu;
 
 namespace mlir::triton::musa_tle {
 
+namespace {
+struct MUSATLEInlinerInterface final : public DialectInlinerInterface {
+  using DialectInlinerInterface::DialectInlinerInterface;
+  bool isLegalToInline(Operation *op, Region *, bool, IRMapping &) const final {
+    // The vendor backend deliberately keeps exclusive-cumsum callees
+    // outlined; preserve that existing contract while allowing barriers.
+    if (isa<ExclusiveCumsumOp>(op))
+      return false;
+    return op->getNumRegions() == 0 && !op->hasTrait<OpTrait::IsTerminator>();
+  }
+};
+} // namespace
+
 void MUSATLEDialect::initialize() {
+  addInterfaces<MUSATLEInlinerInterface>();
   addOperations<
 #define GET_OP_LIST
 #include "Dialect/MUSATLE/IR/Ops.cpp.inc"
