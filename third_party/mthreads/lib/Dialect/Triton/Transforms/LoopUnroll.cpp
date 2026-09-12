@@ -1,3 +1,4 @@
+#include "mlir/Dialect/LLVMIR/LLVMAttrs.h"
 #include "mlir/Dialect/SCF/Utils/Utils.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/Matchers.h"
@@ -33,17 +34,58 @@ class LoopUnrollPass : public impl::TritonLoopUnrollBase<LoopUnrollPass> {
   const char *loopUnrollFactorAttrName = "tt.loop_unroll_factor";
   const char *pipelineStagesAttrName = "tt.num_stages";
 
+  /// Return `annotation` with its unroll component replaced by an explicit
+  /// `llvm.loop.unroll.disable`.  Preserve every other loop hint, in
+  /// particular the LICM disable emitted by `tl.range(disable_licm=True)`.
+  LLVM::LoopAnnotationAttr
+  withUnrollingDisabled(MLIRContext *ctx,
+                        LLVM::LoopAnnotationAttr annotation) {
+    auto unroll = LLVM::LoopUnrollAttr::get(
+        ctx, BoolAttr::get(ctx, true), {}, {}, {}, {}, {}, {});
+    if (!annotation)
+      return LLVM::LoopAnnotationAttr::get(
+          ctx, {}, {}, {}, unroll, {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
+          {});
+
+    return LLVM::LoopAnnotationAttr::get(
+        ctx, annotation.getDisableNonforced(), annotation.getVectorize(),
+        annotation.getInterleave(), unroll, annotation.getUnrollAndJam(),
+        annotation.getLicm(), annotation.getDistribute(),
+        annotation.getPipeline(), annotation.getPeeled(),
+        annotation.getUnswitch(), annotation.getMustProgress(),
+        annotation.getIsVectorized(), annotation.getStartLoc(),
+        annotation.getEndLoc(), annotation.getParallelAccesses());
+  }
+
 public:
   void runOnOperation() override {
     LDBG("Loop unroll pass");
     SmallVector<scf::ForOp, 4> loops;
+    SmallVector<scf::ForOp, 4> loopsToDisable;
     getOperation()->walk([&](scf::ForOp forOp) {
-      // Bail out for loops with unroll factor <= 1.
-      if (getUnrollFactorOrDefault(forOp) > 1)
+      // Attribute absence deliberately keeps the historical behavior: the
+      // Triton pass does nothing and LLVM may use its normal unroll heuristic.
+      // Only an explicitly requested factor of one means end-to-end no-unroll.
+      auto factor =
+          forOp->getAttrOfType<IntegerAttr>(loopUnrollFactorAttrName);
+      if (!factor)
+        return;
+      if (factor.getInt() == 1)
+        loopsToDisable.push_back(forOp);
+      else if (factor.getInt() > 1)
         loops.push_back(forOp);
     });
 
     auto ctx = getOperation()->getContext();
+    for (auto loop : loopsToDisable) {
+      auto annotation = loop->getAttrOfType<LLVM::LoopAnnotationAttr>(
+          "llvm.loop_annotation");
+      loop->setAttr("llvm.loop_annotation",
+                    withUnrollingDisabled(ctx, annotation));
+      loop->removeAttr(loopUnrollFactorAttrName);
+      LDBG("Disabling LLVM loop unrolling for loop\n" << loop);
+    }
+
     for (auto loop : loops) {
       auto unrollFactor = getUnrollFactorOrDefault(loop);
       loop->removeAttr(loopUnrollFactorAttrName);
