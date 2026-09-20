@@ -525,8 +525,8 @@ struct MemDescIndexOpConversion
     // overlap. getAllocationShapePerCTA also accounts for fp4 padding.
     ArrayRef<int64_t> allocationShape =
         dstTy.getAllocShape().take_back(dstTy.getRank());
-    auto stride = product(
-        getAllocationShapePerCTA(dstTy.getEncoding(), allocationShape));
+    auto stride =
+        product(getAllocationShapePerCTA(dstTy.getEncoding(), allocationShape));
     bool isSubview = srcTy.getAllocShape() != srcTy.getShape();
     Value offset;
     if (!isSubview)

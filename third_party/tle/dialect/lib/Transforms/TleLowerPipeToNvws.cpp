@@ -283,8 +283,7 @@ getCommitFieldIndexForTarget(Value target, PipeWriterCommitOp commit) {
     }
 
     if (auto index = current.getDefiningOp<ttg::MemDescIndexOp>()) {
-      if (sawStageIndex ||
-          !sameIndexValue(index.getIndex(), commit.getStage()))
+      if (sawStageIndex || !sameIndexValue(index.getIndex(), commit.getStage()))
         return std::nullopt;
       sawStageIndex = true;
       current = canonicalizePipeField(index.getSrc());
@@ -353,10 +352,8 @@ static bool arePipeFieldsProvablyDisjoint(Value lhs, Value rhs) {
   if (getMemDescRoot(lhs) != getMemDescRoot(rhs))
     return true;
 
-  std::optional<StaticMemDescSubview> lhsView =
-      getStaticMemDescSubview(lhs);
-  std::optional<StaticMemDescSubview> rhsView =
-      getStaticMemDescSubview(rhs);
+  std::optional<StaticMemDescSubview> lhsView = getStaticMemDescSubview(lhs);
+  std::optional<StaticMemDescSubview> rhsView = getStaticMemDescSubview(rhs);
   if (!lhsView || !rhsView || lhsView->root != rhsView->root ||
       lhsView->shape.size() != rhsView->shape.size())
     return false;
@@ -364,10 +361,8 @@ static bool arePipeFieldsProvablyDisjoint(Value lhs, Value rhs) {
   for (size_t dim = 0; dim < lhsView->shape.size(); ++dim) {
     int64_t lhsBegin = lhsView->offsets[dim];
     int64_t rhsBegin = rhsView->offsets[dim];
-    if (lhsView->shape[dim] >
-            std::numeric_limits<int64_t>::max() - lhsBegin ||
-        rhsView->shape[dim] >
-            std::numeric_limits<int64_t>::max() - rhsBegin)
+    if (lhsView->shape[dim] > std::numeric_limits<int64_t>::max() - lhsBegin ||
+        rhsView->shape[dim] > std::numeric_limits<int64_t>::max() - rhsBegin)
       return false;
     int64_t lhsEnd = lhsBegin + lhsView->shape[dim];
     int64_t rhsEnd = rhsBegin + rhsView->shape[dim];
