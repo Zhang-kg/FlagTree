@@ -682,7 +682,16 @@ class buffered_tensor(tl.base_value):
         sub_shape[dim] = length
         sub_ty = buffered_tensor_type(self.dtype, sub_shape, self.type.storage, self.type.layout, _semantic,
                                       alloc_shape=self.type.alloc_shape)
-        sub_handle = _semantic.builder.create_memdesc_subslice(sub_ty.to_ir(_semantic.builder), self.handle, offsets)
+        from . import semantic as tle_semantic
+        sub_handle = tle_semantic.subview(
+            self,
+            offsets,
+            sub_shape,
+            [1] * rank,
+            self.type.layout,
+            _semantic,
+            alloc_shape=self.type.alloc_shape,
+        )
         return buffered_tensor(sub_handle, self.dtype, sub_shape, self.type.storage, self.type.layout, _semantic,
                                alloc_shape=sub_ty.alloc_shape)
 
