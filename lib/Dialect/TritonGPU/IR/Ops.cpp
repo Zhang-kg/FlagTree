@@ -982,6 +982,13 @@ LogicalResult MemDescIndexOp::verify() {
     return emitError("result shape must equal to srcShape[1:]");
   }
 
+  bool isSubview = srcTy.getAllocShape() != srcTy.getShape();
+#ifndef __TLE__
+  if (isSubview) {
+    return emitError("We don't support memdesc_index of a subview");
+  }
+#endif
+
   auto srcEnc = srcTy.getEncoding();
   auto dstEnc = dstTy.getEncoding();
   if (bool(srcEnc) != bool(dstEnc)) {
@@ -992,15 +999,22 @@ LogicalResult MemDescIndexOp::verify() {
     return emitError("src and dst must have the same type of encoding");
   }
 
-  bool isSubview = srcTy.getAllocShape() != srcTy.getShape();
+#ifdef __TLE__
   ArrayRef<int64_t> expectedDstAllocShape =
       isSubview ? srcTy.getAllocShape() : dstTy.getShape();
   if (dstTy.getAllocShape() != expectedDstAllocShape) {
+    if (!isSubview)
+      return emitError("alloc shape must match shape for both result and src");
     return emitError("result alloc shape must be ")
            << expectedDstAllocShape
-           << (isSubview ? " to preserve the indexed subview allocation"
-                         : " for a root allocation");
+           << " to preserve the indexed subview allocation";
   }
+#else
+  if (dstTy.getAllocShape() != dstTy.getShape() ||
+      srcTy.getAllocShape() != srcTy.getShape()) {
+    return emitError("alloc shape must match shape for both result and src");
+  }
+#endif
 
   if (isa<triton::nvidia_gpu::TensorMemoryEncodingAttr>(srcEnc)) {
     // We support only 3D -> 2D subviews with only first offset being non-zero.

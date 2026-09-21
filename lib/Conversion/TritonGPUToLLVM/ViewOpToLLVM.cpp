@@ -519,6 +519,7 @@ struct MemDescIndexOpConversion
     auto dstTy = op.getResult().getType();
     auto llvmElemTy = getTypeConverter()->convertType(srcTy.getElementType());
 
+#ifdef __TLE__
     // A rank-reduced subview retains the complete backing allocation shape.
     // Use its trailing dimensions for the stage stride rather than the
     // logical subview shape; otherwise adjacent stages of sibling subviews
@@ -531,11 +532,20 @@ struct MemDescIndexOpConversion
     Value offset;
     if (!isSubview)
       offset = b.mul(op.getIndex(), b.i32_val(stride));
+#else
+    // getAllocationShapePerCTA returns the correct number fp4 elements that we
+    // need to skip when we have fp4Padded=True. getShapePerCTA does not account
+    // for this
+    auto stride = product(
+        getAllocationShapePerCTA(dstTy.getEncoding(), dstTy.getShape()));
+    Value offset = b.mul(op.getIndex(), b.i32_val(stride));
+#endif
     auto smemObj = getSharedMemoryObjectFromStruct(loc, adaptor.getSrc(),
                                                    llvmElemTy, rewriter);
     auto base = smemObj.getBase();
     auto elemPtrTy = base.getType();
     auto prevOffsets = smemObj.getOffsets();
+#ifdef __TLE__
     assert(prevOffsets.size() >= static_cast<size_t>(srcTy.getRank()) &&
            "shared-memory object must carry one offset per logical dimension");
     // A subslice may also start at a non-zero position in the leading stage
@@ -546,6 +556,7 @@ struct MemDescIndexOpConversion
       Value effectiveIndex = b.add(op.getIndex(), leadingOffset);
       offset = b.mul(effectiveIndex, b.i32_val(stride));
     }
+#endif
     SmallVector<Value> offsetVals(prevOffsets.end() - dstTy.getRank(),
                                   prevOffsets.end());
 
