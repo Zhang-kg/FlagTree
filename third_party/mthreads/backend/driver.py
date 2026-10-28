@@ -1118,7 +1118,9 @@ class MusaDriver(DriverBase):
         from triton.testing import do_bench
         return do_bench
 
-    # flagtree: MThreads TensorDescriptor strides require 4-byte alignment
+    # FlagTree MThreads additive extension (no matching upstream Triton PR and
+    # no original block replaced): override the default because MThreads TME
+    # descriptors support 4-byte-aligned strides.
     def get_tensor_descriptor_stride_alignment(self):
         return 4
 

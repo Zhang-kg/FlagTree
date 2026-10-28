@@ -25,7 +25,10 @@ from typing import List, Any
 from triton._utils import validate_block_shape
 
 
-# flagtree: query the active backend for its TensorDescriptor stride-alignment contract
+# FlagTree-only additive extension (no matching upstream Triton PR and no
+# original block replaced): query the active backend for its TensorDescriptor
+# stride-alignment contract, falling back to Triton's 16-byte rule when no
+# runtime driver is active.
 def _get_stride_alignment():
     # Import lazily to avoid importing runtime drivers while triton.tools is
     # being initialized.  A tools-only process may have no active driver; in
@@ -64,11 +67,20 @@ class TensorDescriptor:
         if ty.__name__ not in ("FakeTensor", "FunctionalTensor"):
             assert self.base.data_ptr() % 16 == 0, "base must be 16-byte aligned"
         validate_block_shape(self.block_shape)
-        # flagtree: use the backend-specific TensorDescriptor stride alignment
+
+        # Original Triton validation (kept for review context):
+        #
+        # elem_bytes = self.base.dtype.itemsize
+        # for stride in self.strides[:-1]:
+        #     assert (stride * elem_bytes) % 16 == 0, \
+        #         "strides must be 16-byte aligned"
+        #
+        # FlagTree/MThreads extension (no matching upstream Triton PR): replace
+        # the fixed 16-byte check with the backend contract. Other backends keep
+        # the 16-byte default; MThreads uses its hardware-supported 4-byte rule.
         stride_alignment = _get_stride_alignment()
         elem_bytes = self.base.dtype.itemsize
         for stride in self.strides[:-1]:
-            # flagtree: validate descriptor strides against the backend contract
             assert (stride * elem_bytes) % stride_alignment == 0, \
                 f"strides must be {stride_alignment}-byte aligned"
         for shape_dim in self.shape:
