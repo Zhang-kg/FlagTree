@@ -131,6 +131,45 @@ def _persistent_single_reader(
 
 
 @triton.jit
+def _persistent_single_reader_with_epoch(
+    reader,
+    consumer_epoch,
+    out,
+    outer_tiles: tl.constexpr,
+    k_tiles: tl.constexpr,
+):
+    block_m: tl.constexpr = 256
+    block_n: tl.constexpr = 256
+    half_n: tl.constexpr = 128
+    for tile in range(outer_tiles):
+        tle.gpu.barrier_wait(consumer_epoch, phaseIdx=(tile + 1) & 1)
+        acc_lo = tl.zeros((block_m, half_n), tl.float32)
+        acc_hi = tl.zeros((block_m, half_n), tl.float32)
+        for k_iter in range(k_tiles):
+            token = tile * k_tiles + k_iter
+            ready = reader.wait(token)
+            b_lo = ready.slot.b.subslice(0, half_n, dim=1)
+            b_hi = ready.slot.b.subslice(half_n, half_n, dim=1)
+            acc_lo = tle.gpu.wgmma(ready.slot.a, b_lo, acc_lo)
+            acc_hi = tle.gpu.wgmma(ready.slot.a, b_hi, acc_hi)
+            acc_lo = tle.gpu.wgmma_wait(0, acc_lo)
+            acc_hi = tle.gpu.wgmma_wait(0, acc_hi)
+            reader.release(token)
+
+        rows = tile * block_m + tl.arange(0, block_m)
+        cols = tl.arange(0, half_n)
+        tl.store(
+            out + rows[:, None] * block_n + cols[None, :],
+            acc_lo.to(out.dtype.element_ty),
+        )
+        tl.store(
+            out + rows[:, None] * block_n + half_n + cols[None, :],
+            acc_hi.to(out.dtype.element_ty),
+        )
+        tle.gpu.barrier_arrive(consumer_epoch, phaseIdx=tile & 1)
+
+
+@triton.jit
 def _persistent_single_reader_kernel(
     a_desc,
     b_desc,
@@ -166,6 +205,63 @@ def _persistent_single_reader_kernel(
             (
                 _persistent_single_reader,
                 (pipe.reader(), out, OUTER_TILES, K_TILES),
+            ),
+            (
+                _persistent_single_writer,
+                (pipe.writer(), a_desc, b_desc, OUTER_TILES, K_TILES),
+            ),
+        ],
+        worker_num_warps=[4],
+        worker_num_regs=[192],
+    )
+
+
+@triton.jit
+def _persistent_single_reader_with_epoch_kernel(
+    a_desc,
+    b_desc,
+    out,
+    OUTER_TILES: tl.constexpr,
+    K_TILES: tl.constexpr,
+    EPOCH_ARRIVALS: tl.constexpr,
+):
+    block_m: tl.constexpr = 256
+    block_n: tl.constexpr = 256
+    block_k: tl.constexpr = 64
+    stages: tl.constexpr = 3
+    a = tle.gpu.alloc(
+        (stages, block_m, block_k),
+        dtype=tl.bfloat16,
+        layout=None,
+        nv_mma_shared_layout=True,
+    )
+    b = tle.gpu.alloc(
+        (stages, block_k, block_n),
+        dtype=tl.bfloat16,
+        layout=None,
+        nv_mma_shared_layout=True,
+    )
+    pipe = tle.pipe(
+        capacity=stages,
+        scope="cta",
+        name="persistent_single_reader_with_epoch",
+        a=a,
+        b=b,
+    )
+    consumer_epoch = tle.gpu.alloc_barrier(
+        arrive_count=EPOCH_ARRIVALS, init=tle.gpu.PENDING
+    )
+    tle.gpu.warp_specialize(
+        [
+            (
+                _persistent_single_reader_with_epoch,
+                (
+                    pipe.reader(),
+                    consumer_epoch,
+                    out,
+                    OUTER_TILES,
+                    K_TILES,
+                ),
             ),
             (
                 _persistent_single_writer,
@@ -659,6 +755,47 @@ def test_tme_only_pipe_does_not_get_local_store_wait_groups():
     )
     ttgir = compiled.asm["ttgir"]
     assert "musa_tle.pipe_local_store_group" not in ttgir
+
+
+def _compile_single_reader_with_explicit_epoch(epoch_arrivals):
+    return compile_musa(
+        _persistent_single_reader_with_epoch_kernel,
+        {
+            "a_desc": "tensordesc<bf16[256, 64]>",
+            "b_desc": "tensordesc<bf16[64, 256]>",
+            "out": "*bf16",
+            "OUTER_TILES": "constexpr",
+            "K_TILES": "constexpr",
+            "EPOCH_ARRIVALS": "constexpr",
+        },
+        {
+            "OUTER_TILES": 18,
+            "K_TILES": 9,
+            "EPOCH_ARRIVALS": epoch_arrivals,
+        },
+        options={"num_warps": 16, "num_stages": 1},
+    )
+
+
+def test_explicit_consumer_epoch_barrier_avoids_duplicate():
+    compiled = _compile_single_reader_with_explicit_epoch(epoch_arrivals=16)
+    llir = compiled.asm["llir"]
+    init_calls = re.findall(
+        r"(?:tail )?call void @llvm\.musa\.async\.init\.arrival\(", llir
+    )
+    # Six barriers belong to the capacity-three full/empty rings.  The
+    # explicit consumer epoch barrier is sufficient, so the compiler must not
+    # allocate an eighth, duplicate epoch barrier.
+    assert len(init_calls) == 7, llir
+
+
+def test_explicit_consumer_epoch_barrier_rejects_insufficient_arrivals(capfd):
+    with pytest.raises(RuntimeError, match="PassManager::run failed"):
+        _compile_single_reader_with_explicit_epoch(epoch_arrivals=1)
+    assert (
+        "explicit consumer epoch barrier arrival count must equal the total "
+        "consumer warp count (16)" in capfd.readouterr().err
+    )
 
 
 @pytest.mark.parametrize("hazard_kind", [0, 1, 2], ids=["war", "non_pipe_waw", "raw"])

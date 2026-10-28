@@ -5,6 +5,7 @@
 #include "MUSATLE/Transforms/TransformAttrs.h"
 #include "TritonMUSAGPUTransforms/Passes.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Dominance.h"
@@ -101,6 +102,118 @@ static bool containsAsyncSqmmaAndGlobalStore(scf::ForOp loop) {
   return hasAsyncSqmma && hasGlobalStore;
 }
 
+static bool equivalentBarrierIds(Value lhs, Value rhs) {
+  if (lhs == rhs)
+    return true;
+  APInt lhsConstant;
+  APInt rhsConstant;
+  return matchPattern(lhs, m_ConstantInt(&lhsConstant)) &&
+         matchPattern(rhs, m_ConstantInt(&rhsConstant)) &&
+         lhsConstant == rhsConstant;
+}
+
+static bool isConstantInt(Value value, int64_t expected) {
+  APInt constant;
+  return matchPattern(value, m_ConstantInt(&constant)) &&
+         constant.getSExtValue() == expected;
+}
+
+// Match the canonical alternating phase emitted by TLE named barriers:
+//   current epoch: iteration & 1
+//   next epoch:    (iteration + 1) & 1
+static bool matchesEpochPhase(Value phase, Value iteration, bool nextEpoch) {
+  auto andOp = phase.getDefiningOp<arith::AndIOp>();
+  if (!andOp)
+    return false;
+
+  Value epoch;
+  if (isConstantInt(andOp.getLhs(), 1))
+    epoch = andOp.getRhs();
+  else if (isConstantInt(andOp.getRhs(), 1))
+    epoch = andOp.getLhs();
+  else
+    return false;
+
+  if (!nextEpoch)
+    return epoch == iteration;
+  auto addOp = epoch.getDefiningOp<arith::AddIOp>();
+  if (!addOp)
+    return false;
+  return (addOp.getLhs() == iteration && isConstantInt(addOp.getRhs(), 1)) ||
+         (addOp.getRhs() == iteration && isConstantInt(addOp.getLhs(), 1));
+}
+
+// A persistent consumer may already carry an explicit epoch barrier, for
+// example an outer-loop header wait paired with a latch arrival.  Only inspect
+// operations directly in the epoch loop body: pipe full/empty barriers live in
+// the nested K loop and must not suppress the compiler-provided rendezvous.
+static FailureOr<std::optional<Value>>
+findTopLevelEpochRendezvous(scf::ForOp epochLoop) {
+  SmallVector<triton::musa::WaitBarrierOp> waits;
+  SmallVector<triton::musa::WarpArriveBarrierOp> arrivals;
+  for (Operation &op : epochLoop.getBody()->getOperations()) {
+    if (auto wait = dyn_cast<triton::musa::WaitBarrierOp>(op))
+      waits.push_back(wait);
+    if (auto arrive = dyn_cast<triton::musa::WarpArriveBarrierOp>(op))
+      arrivals.push_back(arrive);
+  }
+  std::optional<Value> matchedBarrier;
+  for (triton::musa::WaitBarrierOp wait : waits) {
+    for (triton::musa::WarpArriveBarrierOp arrive : arrivals) {
+      if (!equivalentBarrierIds(wait.getBarId(), arrive.getBarId()))
+        continue;
+      // The supported explicit protocol waits for the next phase at the loop
+      // header and arrives on the current phase at the latch.  This is the
+      // same alternating protocol used by compiler-generated epoch syncs.
+      if (!wait->isBeforeInBlock(arrive) ||
+          !matchesEpochPhase(wait.getPhaseId(), epochLoop.getInductionVar(),
+                             /*nextEpoch=*/true) ||
+          !matchesEpochPhase(arrive.getPhaseId(), epochLoop.getInductionVar(),
+                             /*nextEpoch=*/false)) {
+        epochLoop.emitOpError(
+            "explicit consumer epoch barrier must wait on "
+            "(iteration + 1) & 1 at the loop header and arrive on "
+            "iteration & 1 at the loop latch");
+        return failure();
+      }
+      if (matchedBarrier) {
+        epochLoop.emitOpError(
+            "requires exactly one explicit consumer epoch barrier pair");
+        return failure();
+      }
+      matchedBarrier = wait.getBarId();
+    }
+  }
+  return matchedBarrier;
+}
+
+static LogicalResult validateExplicitEpochBarrierInitialization(
+    ttg::WarpSpecializeOp ws, Value barrier, int32_t consumerWarps) {
+  auto func = ws->getParentOfType<triton::FuncOp>();
+  SmallVector<triton::musa::InitArrivalOp> matchingInitializers;
+  func.walk([&](triton::musa::InitArrivalOp init) {
+    if (equivalentBarrierIds(init.getBarId(), barrier))
+      matchingInitializers.push_back(init);
+  });
+  if (matchingInitializers.size() != 1)
+    return ws.emitOpError(
+        "explicit consumer epoch barrier requires exactly one matching "
+        "initialization");
+
+  triton::musa::InitArrivalOp init = matchingInitializers.front();
+  APInt arriveCount;
+  if (!matchPattern(init.getArriveCount(), m_ConstantInt(&arriveCount)) ||
+      arriveCount.getSExtValue() != consumerWarps)
+    return ws.emitOpError()
+           << "explicit consumer epoch barrier arrival count must equal the "
+              "total consumer warp count ("
+           << consumerWarps << ")";
+  if (!isConstantInt(init.getPhaseId(), 0))
+    return ws.emitOpError(
+        "explicit consumer epoch barrier must initialize phase 0");
+  return success();
+}
+
 static FailureOr<int64_t> getPositiveConstantStep(scf::ForOp loop) {
   APInt step;
   if (!matchPattern(loop.getStep(), m_ConstantInt(&step)) ||
@@ -151,6 +264,7 @@ static bool equivalentConsumerBounds(Value lhs, Region &lhsConsumer, Value rhs,
 // merges equal markers into one hardware barrier and derives its alternating
 // phase from the loop iteration count.
 static LogicalResult markConsumerEpochRendezvous(ttg::WarpSpecializeOp ws,
+                                                 int32_t consumerWarps,
                                                  IRRewriter &rewriter) {
   if (!ws->hasAttr(musa_tle::kMUSATLEConsumerEpochRendezvousRequiredAttr))
     return success();
@@ -186,6 +300,7 @@ static LogicalResult markConsumerEpochRendezvous(ttg::WarpSpecializeOp ws,
     return skipInference();
 
   SmallVector<scf::ForOp> epochLoops;
+  SmallVector<std::optional<Value>> explicitEpochBarriers;
   Region *commonConsumer = nullptr;
   Value commonLower;
   Value commonUpper;
@@ -241,6 +356,41 @@ static LogicalResult markConsumerEpochRendezvous(ttg::WarpSpecializeOp ws,
       commonStep = *step;
     }
     epochLoops.push_back(loop);
+    FailureOr<std::optional<Value>> explicitEpoch =
+        findTopLevelEpochRendezvous(loop);
+    if (failed(explicitEpoch))
+      return failure();
+    explicitEpochBarriers.push_back(*explicitEpoch);
+  }
+
+  bool hasAnyExplicitEpoch = llvm::any_of(
+      explicitEpochBarriers,
+      [](const std::optional<Value> &barrier) { return barrier.has_value(); });
+  bool hasAllExplicitEpoch = llvm::all_of(
+      explicitEpochBarriers,
+      [](const std::optional<Value> &barrier) { return barrier.has_value(); });
+  if (hasAnyExplicitEpoch != hasAllExplicitEpoch)
+    return ws.emitOpError(
+        "MUSA TLE persistent named-reader consumers must either all provide "
+        "an explicit top-level epoch wait/arrival pair or all rely on the "
+        "compiler-provided rendezvous");
+  if (hasAllExplicitEpoch) {
+    Value commonBarrier = *explicitEpochBarriers.front();
+    Region *commonBarrierConsumer = consumers.front();
+    for (auto [consumer, barrier] :
+         llvm::zip(ArrayRef<Region *>(consumers).drop_front(),
+                   ArrayRef<std::optional<Value>>(explicitEpochBarriers)
+                       .drop_front())) {
+      if (!equivalentConsumerBounds(commonBarrier, *commonBarrierConsumer,
+                                    *barrier, *consumer, ws))
+        return ws.emitOpError(
+            "MUSA TLE persistent named-reader consumers must use the same "
+            "explicit top-level epoch barrier");
+    }
+    if (failed(validateExplicitEpochBarrierInitialization(ws, commonBarrier,
+                                                          consumerWarps)))
+      return failure();
+    return skipInference();
   }
 
   for (scf::ForOp loop : epochLoops) {
@@ -398,7 +548,10 @@ class PrepareWarpSpecializePass
                    rewriter.getI32IntegerAttr(totalNumWarps));
     }
 
-    if (failed(markConsumerEpochRendezvous(ws, rewriter)))
+    int32_t consumerWarps = baseNumWarps;
+    for (unsigned index = 0; index + 1 < workerWarps.size(); ++index)
+      consumerWarps += workerWarps[index];
+    if (failed(markConsumerEpochRendezvous(ws, consumerWarps, rewriter)))
       return failure();
 
     return success();
