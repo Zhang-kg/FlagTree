@@ -4,6 +4,7 @@
 #include "MUSATLE/Transforms/TransformAttrs.h"
 #include "TritonMUSACommon/MMAContractUtils.h"
 #include "TritonMUSACommon/MMAEncodingUtils.h"
+#include "TritonMUSACommon/TMEUtils.h"
 #include "TritonMUSAGPUTransforms/Passes.h"
 #include "ir.h"
 #include "mlir/IR/DialectRegistry.h"
@@ -20,10 +21,12 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/raw_ostream.h"
 #include <cstdint>
+#include <optional>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace py = pybind11;
@@ -675,7 +678,8 @@ void init_triton_musa_tle_ir(py::module m) {
           "create_tma_copy",
           [](TritonOpBuilder &self, mlir::Value src, mlir::Value dst,
              std::vector<mlir::Value> indices, py::object completionBarrier,
-             int32_t expectBytes) -> void {
+             int32_t expectBytes,
+             std::optional<std::pair<int32_t, int32_t>> cachePolicy) -> void {
             mlir::Value barrier;
             if (!completionBarrier.is_none())
               barrier = py::cast<mlir::Value>(completionBarrier);
@@ -683,10 +687,18 @@ void init_triton_musa_tle_ir(py::module m) {
             if (expectBytes >= 0)
               op->setAttr("expect_bytes",
                           self.getBuilder().getI32IntegerAttr(expectBytes));
+            if (cachePolicy) {
+              op->setAttr(
+                  musa::kTMEInnerPersistenceAttr,
+                  self.getBuilder().getI32IntegerAttr(cachePolicy->first));
+              op->setAttr(
+                  musa::kTMEOuterPersistenceAttr,
+                  self.getBuilder().getI32IntegerAttr(cachePolicy->second));
+            }
           },
           py::arg("src"), py::arg("dst"), py::arg("indices"),
           py::arg("completionBarrier") = py::none(),
-          py::arg("expectBytes") = -1)
+          py::arg("expectBytes") = -1, py::arg("cachePolicy") = py::none())
       .def("create_pipe_create",
            [](TritonOpBuilder &self, std::vector<mlir::Value> fields,
               int32_t capacity, const std::string &scope,
