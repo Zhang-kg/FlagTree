@@ -347,6 +347,80 @@ def _persistent_tail_reader(
 
 
 @triton.jit
+def _conditional_persistent_tail_reader(
+    reader,
+    out,
+    start_tile,
+    outer_tiles,
+    num_sms: tl.constexpr,
+    k_tiles: tl.constexpr,
+    enabled,
+):
+    block_m: tl.constexpr = 256
+    block_n: tl.constexpr = 320
+    main_n: tl.constexpr = 256
+    tail_n: tl.constexpr = 64
+    if enabled != 0:
+        for tile in range(start_tile, outer_tiles, num_sms):
+            epoch = (tile - start_tile) // num_sms
+            acc = tl.zeros((block_m, tail_n), tl.float32)
+            for k_iter in range(k_tiles):
+                token = epoch * k_tiles + k_iter
+                ready = reader.wait(token)
+                acc = tle.gpu.wgmma(ready.slot.a, ready.slot.b_tail, acc)
+                acc = tle.gpu.wgmma_wait(0, acc)
+                reader.release(token)
+
+            rows = tile * block_m + tl.arange(0, block_m)
+            cols = main_n + tl.arange(0, tail_n)
+            tl.store(
+                out + rows[:, None] * block_n + cols[None, :],
+                acc.to(out.dtype.element_ty),
+            )
+
+
+@triton.jit
+def _conditional_persistent_main_reader(
+    reader,
+    out,
+    start_tile,
+    outer_tiles,
+    num_sms: tl.constexpr,
+    k_tiles: tl.constexpr,
+    enabled,
+):
+    block_m: tl.constexpr = 256
+    block_n: tl.constexpr = 320
+    half_n: tl.constexpr = 128
+    if enabled != 0:
+        for tile in range(start_tile, outer_tiles, num_sms):
+            epoch = (tile - start_tile) // num_sms
+            acc_lo = tl.zeros((block_m, half_n), tl.float32)
+            acc_hi = tl.zeros((block_m, half_n), tl.float32)
+            for k_iter in range(k_tiles):
+                token = epoch * k_tiles + k_iter
+                ready = reader.wait(token)
+                b_lo = ready.slot.b_main.subslice(0, half_n, dim=1)
+                b_hi = ready.slot.b_main.subslice(half_n, half_n, dim=1)
+                acc_lo = tle.gpu.wgmma(ready.slot.a, b_lo, acc_lo)
+                acc_hi = tle.gpu.wgmma(ready.slot.a, b_hi, acc_hi)
+                acc_lo = tle.gpu.wgmma_wait(0, acc_lo)
+                acc_hi = tle.gpu.wgmma_wait(0, acc_hi)
+                reader.release(token)
+
+            rows = tile * block_m + tl.arange(0, block_m)
+            cols = tl.arange(0, half_n)
+            tl.store(
+                out + rows[:, None] * block_n + cols[None, :],
+                acc_lo.to(out.dtype.element_ty),
+            )
+            tl.store(
+                out + rows[:, None] * block_n + half_n + cols[None, :],
+                acc_hi.to(out.dtype.element_ty),
+            )
+
+
+@triton.jit
 def _persistent_multi_reader_kernel(
     a_desc,
     b_main_desc,
@@ -432,6 +506,135 @@ def _persistent_multi_reader_kernel(
     )
 
 
+@triton.jit
+def _persistent_conditional_readers_kernel(
+    a_desc,
+    b_main_desc,
+    b_tail_desc,
+    out,
+    tail_enabled,
+    main_enabled,
+    OUTER_TILES,
+    NUM_SMS: tl.constexpr,
+    K_TILES: tl.constexpr,
+):
+    block_m: tl.constexpr = 256
+    block_k: tl.constexpr = 64
+    main_n: tl.constexpr = 256
+    tail_n: tl.constexpr = 64
+    stages: tl.constexpr = 2
+    a = tle.gpu.alloc(
+        (stages, block_m, block_k),
+        dtype=tl.bfloat16,
+        layout=None,
+        nv_mma_shared_layout=True,
+    )
+    b_main = tle.gpu.alloc(
+        (stages, block_k, main_n),
+        dtype=tl.bfloat16,
+        layout=None,
+        nv_mma_shared_layout=True,
+    )
+    b_tail = tle.gpu.alloc(
+        (stages, block_k, tail_n),
+        dtype=tl.bfloat16,
+        layout=None,
+        nv_mma_shared_layout=True,
+    )
+    pipe = tle.pipe(
+        capacity=stages,
+        scope="cta",
+        name="persistent_conditional_readers",
+        readers=("tail", "main"),
+        a=a,
+        b_main=b_main,
+        b_tail=b_tail,
+    )
+    start_tile = tl.program_id(0)
+    tle.gpu.warp_specialize(
+        [
+            (
+                _conditional_persistent_tail_reader,
+                (
+                    pipe.reader("tail"),
+                    out,
+                    start_tile,
+                    OUTER_TILES,
+                    NUM_SMS,
+                    K_TILES,
+                    tail_enabled,
+                ),
+            ),
+            (
+                _conditional_persistent_main_reader,
+                (
+                    pipe.reader("main"),
+                    out,
+                    start_tile,
+                    OUTER_TILES,
+                    NUM_SMS,
+                    K_TILES,
+                    main_enabled,
+                ),
+            ),
+            (
+                _persistent_multi_writer,
+                (
+                    pipe.writer(),
+                    a_desc,
+                    b_main_desc,
+                    b_tail_desc,
+                    start_tile,
+                    OUTER_TILES,
+                    NUM_SMS,
+                    K_TILES,
+                ),
+            ),
+        ],
+        worker_num_warps=[16, 4],
+        worker_num_regs=[128, 24],
+    )
+
+
+@triton.jit
+def _non_sqmma_writer(writer, iterations: tl.constexpr):
+    for iteration in range(iterations):
+        slot = writer.acquire(iteration)
+        tl.store(tle.gpu.local_ptr(slot.value, (0, )), iteration)
+        writer.commit(iteration)
+
+
+@triton.jit
+def _non_sqmma_reader(reader, out, output_offset: tl.constexpr, iterations: tl.constexpr):
+    for iteration in range(iterations):
+        ready = reader.wait(iteration)
+        value = tl.load(tle.gpu.local_ptr(ready.slot.value, (0, )))
+        tl.store(out + output_offset + iteration, value)
+        reader.release(iteration)
+
+
+@triton.jit
+def _persistent_non_sqmma_multi_reader_kernel(out, ITERATIONS: tl.constexpr):
+    stages: tl.constexpr = 2
+    value = tle.gpu.alloc((stages, 1), dtype=tl.int32, nv_mma_shared_layout=False)
+    pipe = tle.pipe(
+        capacity=stages,
+        scope="cta",
+        name="persistent_non_sqmma_multi_reader",
+        readers=("left", "right"),
+        value=value,
+    )
+    tle.gpu.warp_specialize(
+        [
+            (_non_sqmma_reader, (pipe.reader("left"), out, 0, ITERATIONS)),
+            (_non_sqmma_reader, (pipe.reader("right"), out, ITERATIONS, ITERATIONS)),
+            (_non_sqmma_writer, (pipe.writer(), ITERATIONS)),
+        ],
+        worker_num_warps=[4, 4],
+        worker_num_regs=[24, 24],
+    )
+
+
 def _make_inputs(m, n, k):
     torch.manual_seed(20260925)
     a_cpu = torch.randn((m, k), dtype=torch.bfloat16)
@@ -506,6 +709,71 @@ def test_persistent_named_readers_accept_runtime_grid_stride_bounds():
     epoch_barrier_id = epoch_barrier_ids[-1]
     assert llir.count(f"call void @llvm.musa.async.arrive.none.phaseid(i32 {epoch_barrier_id})") == 2
     assert llir.count(f"call void @llvm.musa.async.wait(i32 {epoch_barrier_id},") == 2
+
+
+@pytest.mark.parametrize(
+    "signature,constexprs",
+    [
+        (
+            {
+                "a_desc": "tensordesc<bf16[256, 64]>",
+                "b_main_desc": "tensordesc<bf16[64, 256]>",
+                "b_tail_desc": "tensordesc<bf16[64, 64]>",
+                "out": "*bf16",
+                "tail_enabled": "i32",
+                "main_enabled": "constexpr",
+                "OUTER_TILES": "i32",
+                "NUM_SMS": "constexpr",
+                "K_TILES": "constexpr",
+            },
+            {"main_enabled": 1, "NUM_SMS": 2, "K_TILES": 4},
+        ),
+        (
+            {
+                "a_desc": "tensordesc<bf16[256, 64]>",
+                "b_main_desc": "tensordesc<bf16[64, 256]>",
+                "b_tail_desc": "tensordesc<bf16[64, 64]>",
+                "out": "*bf16",
+                "tail_enabled": "i32",
+                "main_enabled": "i32",
+                "OUTER_TILES": "i32",
+                "NUM_SMS": "constexpr",
+                "K_TILES": "constexpr",
+            },
+            {"NUM_SMS": 2, "K_TILES": 4},
+        ),
+    ],
+    ids=["one-conditional-consumer", "two-independent-conditional-consumers"],
+)
+def test_persistent_named_readers_reject_conditional_epoch_loops(capfd, signature, constexprs):
+    # Compile only: launching this shape before the structural check could
+    # leave one consumer waiting forever on the shared epoch barrier.
+    with pytest.raises(RuntimeError, match="PassManager::run failed"):
+        compile_musa(
+            _persistent_conditional_readers_kernel,
+            signature,
+            constexprs,
+            options={"num_warps": 4, "num_stages": 1},
+        )
+    assert ("requires the consumer epoch loop to be an unconditional top-level operation" in capfd.readouterr().err)
+
+
+def test_persistent_non_sqmma_multi_reader_does_not_require_epoch_rendezvous():
+    # The pipe's normal full/empty protocol is sufficient when no asynchronous
+    # SQMMA completion must be joined across consumer partitions.
+    compiled = compile_musa(
+        _persistent_non_sqmma_multi_reader_kernel,
+        {"out": "*i32", "ITERATIONS": "constexpr"},
+        {"ITERATIONS": 5},
+        options={"num_warps": 4, "num_stages": 1},
+    )
+    consumer_barriers = re.findall(
+        r"call void @llvm\.musa\.async\.init\.arrival\(i32 (\d+), i32 8, i32 0\)",
+        compiled.asm["llir"],
+    )
+    # The two entries are the capacity-two pipe's empty barriers. An inferred
+    # consumer epoch rendezvous would add a third arrival-count-eight barrier.
+    assert len(consumer_barriers) == 2
 
 
 @pytest.mark.skipif(not torch.musa.is_available(), reason="MUSA device is not available")

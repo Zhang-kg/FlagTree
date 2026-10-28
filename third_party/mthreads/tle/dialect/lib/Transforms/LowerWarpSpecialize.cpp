@@ -83,14 +83,19 @@ static LogicalResult validateExplicitCtaSyncs(ttg::WarpSpecializeOp ws) {
   return success();
 }
 
+static bool isAsyncSqmma(Operation *op) {
+  if (auto squadDot = dyn_cast<triton::musa::SquadDotOp>(op))
+    return squadDot.getIsAsync();
+  if (auto sqmma = dyn_cast<triton::mtgpu::SqmmaOp>(op))
+    return sqmma.getIsAsync();
+  return false;
+}
+
 static bool containsAsyncSqmmaAndGlobalStore(scf::ForOp loop) {
   bool hasAsyncSqmma = false;
   bool hasGlobalStore = false;
   loop.walk([&](Operation *op) {
-    if (auto squadDot = dyn_cast<triton::musa::SquadDotOp>(op))
-      hasAsyncSqmma |= squadDot.getIsAsync();
-    else if (auto sqmma = dyn_cast<triton::mtgpu::SqmmaOp>(op))
-      hasAsyncSqmma |= sqmma.getIsAsync();
+    hasAsyncSqmma |= isAsyncSqmma(op);
     hasGlobalStore |= isa<triton::StoreOp>(op);
   });
   return hasAsyncSqmma && hasGlobalStore;
@@ -140,9 +145,10 @@ static bool equivalentConsumerBounds(Value lhs, Region &lhsConsumer, Value rhs,
 // reuse a warp-specialized CTA across output tiles therefore need one shared
 // rendezvous at each consumer outer-loop latch.  Bounds may be runtime values
 // (the canonical persistent schedule is range(pid, num_tiles, NUM_SMS)), but
-// every consumer must use equivalent lower/upper bounds and the same positive
-// constant step.  Late lowering merges equal markers into one hardware
-// barrier and derives its alternating phase from the loop iteration count.
+// every consumer must execute one unconditional top-level loop with equivalent
+// lower/upper bounds and the same positive constant step.  Late lowering
+// merges equal markers into one hardware barrier and derives its alternating
+// phase from the loop iteration count.
 static LogicalResult markConsumerEpochRendezvous(ttg::WarpSpecializeOp ws,
                                                  IRRewriter &rewriter) {
   if (!ws->hasAttr(musa_tle::kMUSATLEConsumerEpochRendezvousRequiredAttr))
@@ -165,16 +171,29 @@ static LogicalResult markConsumerEpochRendezvous(ttg::WarpSpecializeOp ws,
   SmallVector<SmallVector<scf::ForOp>> candidatesByConsumer;
   candidatesByConsumer.reserve(consumers.size());
   bool hasPersistentCandidate = false;
+  bool hasAsyncSqmma = false;
   for (Region *consumer : consumers) {
     auto &candidates = candidatesByConsumer.emplace_back();
+    consumer->walk([&](Operation *op) { hasAsyncSqmma |= isAsyncSqmma(op); });
     consumer->walk([&](scf::ForOp loop) {
       if (containsAsyncSqmmaAndGlobalStore(loop))
         candidates.push_back(loop);
     });
     hasPersistentCandidate |= !candidates.empty();
   }
-  if (!hasPersistentCandidate)
+  if (!hasPersistentCandidate) {
+    // A cyclic multi-reader pipe also covers non-SQMMA consumers.  Its normal
+    // full/empty barriers already protect slot reuse, so no extra epoch
+    // rendezvous is needed in that case.  If asynchronous SQMMA is present,
+    // however, failing to recognize its epoch/store structure is not proof
+    // that cross-consumer completion is safe; reject it rather than silently
+    // dropping a potentially required rendezvous.
+    if (hasAsyncSqmma)
+      return ws.emitOpError(
+          "MUSA TLE persistent named-reader rendezvous cannot prove an "
+          "unconditional top-level SQMMA/store epoch loop");
     return skipInference();
+  }
 
   SmallVector<scf::ForOp> epochLoops;
   Region *commonConsumer = nullptr;
@@ -183,12 +202,24 @@ static LogicalResult markConsumerEpochRendezvous(ttg::WarpSpecializeOp ws,
   std::optional<int64_t> commonStep;
   for (auto [consumer, candidates] :
        llvm::zip(consumers, candidatesByConsumer)) {
+    if (llvm::any_of(candidates, [&](scf::ForOp loop) {
+          return loop->getParentRegion() != consumer;
+        })) {
+      ws.emitOpError(
+          "MUSA TLE persistent named-reader rendezvous requires the consumer "
+          "epoch loop to be an unconditional top-level operation in every "
+          "consumer partition");
+      return failure();
+    }
     // Nested K loops contain SQMMA but no output store.  Requiring exactly
-    // one SQMMA+store loop keeps this inference deliberately conservative.
+    // one top-level SQMMA+store loop keeps this inference deliberately
+    // conservative and guarantees that every consumer reaches the shared
+    // barrier once per epoch.
     if (candidates.size() != 1) {
       ws.emitOpError(
           "MUSA TLE persistent named-reader rendezvous requires exactly one "
-          "SQMMA/store epoch loop in every consumer partition");
+          "unconditional top-level SQMMA/store epoch loop in every consumer "
+          "partition");
       return failure();
     }
     scf::ForOp loop = candidates.front();
