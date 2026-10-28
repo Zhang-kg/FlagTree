@@ -364,11 +364,12 @@ class LowerPipePass
             "internal MUSA TLE pipe lowering requires a valid full "
             "barrier plan");
 
-      // A persistent named-reader pipe can release its final K token before
-      // every consumer has completed the output-tile epilogue. Record the
-      // static layout as a candidate for an outer-epoch rendezvous; the later
-      // warp-specialize pass inserts one only when it can prove matching
-      // canonical SQMMA/store epoch loops in every consumer.
+      // A persistent reader can release its final K token before all warps in
+      // that consumer, or in the other named consumers, have completed the
+      // output-tile epilogue. Record the static layout as a candidate for an
+      // outer-epoch rendezvous; the later warp-specialize pass inserts one
+      // only when it can prove matching canonical SQMMA/store epoch loops in
+      // every consumer.
       if (state->lifecycle.mode == musa_tle::PipeLifecycleMode::Cyclic &&
           state->staticWarpSpecialize && plan.writerParticipant) {
         ttg::WarpSpecializeOp ws = state->staticWarpSpecialize;
@@ -378,7 +379,7 @@ class LowerPipePass
              plan.readerParticipants)
           readerPartitions.insert(reader.partitionIndex);
         bool coversEveryConsumer =
-            expectedConsumers > 1 &&
+            expectedConsumers > 0 &&
             plan.readerParticipants.size() == expectedConsumers &&
             readerPartitions.size() == expectedConsumers &&
             plan.writerParticipant->partition ==

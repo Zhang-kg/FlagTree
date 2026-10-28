@@ -806,13 +806,13 @@ def test_persistent_single_reader_pipe_reuses_ring_across_output_tiles():
     llir = compiled.asm["llir"]
     assert "llvm.musa.async.init.arrival" in llir
     assert "llvm.musa.async.arrive.none.phaseid" in llir
-    # Three full and three empty pipe barriers are sufficient.  A local
-    # pointer dependency in the producer must not be lowered into a seventh
-    # per-K private barrier; the pipe acquire already supplies that edge.
-    assert "llvm.musa.async.bar.record(i32 6)" in llir
+    # Three full and three empty pipe barriers manage the ring.  The seventh
+    # barrier is a rendezvous for the persistent consumer warps once per
+    # output-tile epoch before the shared ring is reused by the next tile.
+    assert "llvm.musa.async.bar.record(i32 7)" in llir
     assert "call void @llvm.musa.lma.wait()" in llir
     init_calls = re.findall(r"(?:tail )?call void @llvm\.musa\.async\.init\.arrival\(", llir)
-    assert len(init_calls) == 6
+    assert len(init_calls) == 7
 
 
 @pytest.mark.skipif(not torch.musa.is_available(), reason="MUSA device is not available")

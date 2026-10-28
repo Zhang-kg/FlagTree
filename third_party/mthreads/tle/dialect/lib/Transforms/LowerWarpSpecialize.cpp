@@ -140,13 +140,14 @@ static bool equivalentConsumerBounds(Value lhs, Region &lhsConsumer, Value rhs,
          lhsConstant == rhsConstant;
 }
 
-// SQMMA wait-all retires one partition's work, but it is not a completion
-// edge between independent consumer partitions.  Persistent kernels that
-// reuse a warp-specialized CTA across output tiles therefore need one shared
-// rendezvous at each consumer outer-loop latch.  Bounds may be runtime values
-// (the canonical persistent schedule is range(pid, num_tiles, NUM_SMS)), but
-// every consumer must execute one unconditional top-level loop with equivalent
-// lower/upper bounds and the same positive constant step.  Late lowering
+// SQMMA wait-all retires issued work, but it does not reconverge the consumer
+// warps or provide a completion edge between independent consumer partitions.
+// Persistent kernels that reuse a warp-specialized CTA across output tiles
+// therefore need one rendezvous at each consumer outer-loop latch. Bounds may
+// be runtime values (the canonical persistent schedule is
+// range(pid, num_tiles, NUM_SMS)), but every consumer must execute one
+// unconditional top-level loop with equivalent lower/upper bounds and the
+// same positive constant step. Late lowering
 // merges equal markers into one hardware barrier and derives its alternating
 // phase from the loop iteration count.
 static LogicalResult markConsumerEpochRendezvous(ttg::WarpSpecializeOp ws,
@@ -165,35 +166,24 @@ static LogicalResult markConsumerEpochRendezvous(ttg::WarpSpecializeOp ws,
   // partition.  The default region and preceding workers are consumers.
   for (unsigned index = 0; index + 1 < partitions.size(); ++index)
     consumers.push_back(partitions[index]);
-  if (consumers.size() < 2)
-    return skipInference();
 
   SmallVector<SmallVector<scf::ForOp>> candidatesByConsumer;
   candidatesByConsumer.reserve(consumers.size());
   bool hasPersistentCandidate = false;
-  bool hasAsyncSqmma = false;
   for (Region *consumer : consumers) {
     auto &candidates = candidatesByConsumer.emplace_back();
-    consumer->walk([&](Operation *op) { hasAsyncSqmma |= isAsyncSqmma(op); });
     consumer->walk([&](scf::ForOp loop) {
       if (containsAsyncSqmmaAndGlobalStore(loop))
         candidates.push_back(loop);
     });
     hasPersistentCandidate |= !candidates.empty();
   }
-  if (!hasPersistentCandidate) {
-    // A cyclic multi-reader pipe also covers non-SQMMA consumers.  Its normal
-    // full/empty barriers already protect slot reuse, so no extra epoch
-    // rendezvous is needed in that case.  If asynchronous SQMMA is present,
-    // however, failing to recognize its epoch/store structure is not proof
-    // that cross-consumer completion is safe; reject it rather than silently
-    // dropping a potentially required rendezvous.
-    if (hasAsyncSqmma)
-      return ws.emitOpError(
-          "MUSA TLE persistent named-reader rendezvous cannot prove an "
-          "unconditional top-level SQMMA/store epoch loop");
+  if (!hasPersistentCandidate)
+    // One-shot named readers have no outer epoch to rendezvous, while cyclic
+    // non-SQMMA readers are already protected by the pipe's full/empty
+    // barriers.  Only validate epoch structure after finding an actual
+    // SQMMA+store loop candidate.
     return skipInference();
-  }
 
   SmallVector<scf::ForOp> epochLoops;
   Region *commonConsumer = nullptr;
@@ -202,8 +192,9 @@ static LogicalResult markConsumerEpochRendezvous(ttg::WarpSpecializeOp ws,
   std::optional<int64_t> commonStep;
   for (auto [consumer, candidates] :
        llvm::zip(consumers, candidatesByConsumer)) {
+    Region *consumerRegion = consumer;
     if (llvm::any_of(candidates, [&](scf::ForOp loop) {
-          return loop->getParentRegion() != consumer;
+          return loop->getParentRegion() != consumerRegion;
         })) {
       ws.emitOpError(
           "MUSA TLE persistent named-reader rendezvous requires the consumer "
