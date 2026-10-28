@@ -25,6 +25,7 @@ from typing import List, Any
 from triton._utils import validate_block_shape
 
 
+# flagtree: query the active backend for its TensorDescriptor stride-alignment contract
 def _get_stride_alignment():
     # Import lazily to avoid importing runtime drivers while triton.tools is
     # being initialized.  A tools-only process may have no active driver; in
@@ -63,9 +64,11 @@ class TensorDescriptor:
         if ty.__name__ not in ("FakeTensor", "FunctionalTensor"):
             assert self.base.data_ptr() % 16 == 0, "base must be 16-byte aligned"
         validate_block_shape(self.block_shape)
+        # flagtree: use the backend-specific TensorDescriptor stride alignment
         stride_alignment = _get_stride_alignment()
         elem_bytes = self.base.dtype.itemsize
         for stride in self.strides[:-1]:
+            # flagtree: validate descriptor strides against the backend contract
             assert (stride * elem_bytes) % stride_alignment == 0, \
                 f"strides must be {stride_alignment}-byte aligned"
         for shape_dim in self.shape:

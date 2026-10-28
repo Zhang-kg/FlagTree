@@ -65,6 +65,7 @@ class DriverBase(metaclass=ABCMeta):
         """
         raise NotImplementedError
 
+    # flagtree: let backends define TensorDescriptor stride alignment
     def get_tensor_descriptor_stride_alignment(self) -> int:
         """Return the target's required byte alignment for descriptor strides."""
         return 16
