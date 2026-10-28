@@ -248,9 +248,7 @@ def _persistent_single_reader_with_epoch_kernel(
         a=a,
         b=b,
     )
-    consumer_epoch = tle.gpu.alloc_barrier(
-        arrive_count=EPOCH_ARRIVALS, init=tle.gpu.PENDING
-    )
+    consumer_epoch = tle.gpu.alloc_barrier(arrive_count=EPOCH_ARRIVALS, init=tle.gpu.PENDING)
     tle.gpu.warp_specialize(
         [
             (
@@ -780,9 +778,7 @@ def _compile_single_reader_with_explicit_epoch(epoch_arrivals):
 def test_explicit_consumer_epoch_barrier_avoids_duplicate():
     compiled = _compile_single_reader_with_explicit_epoch(epoch_arrivals=16)
     llir = compiled.asm["llir"]
-    init_calls = re.findall(
-        r"(?:tail )?call void @llvm\.musa\.async\.init\.arrival\(", llir
-    )
+    init_calls = re.findall(r"(?:tail )?call void @llvm\.musa\.async\.init\.arrival\(", llir)
     # Six barriers belong to the capacity-three full/empty rings.  The
     # explicit consumer epoch barrier is sufficient, so the compiler must not
     # allocate an eighth, duplicate epoch barrier.
@@ -792,10 +788,8 @@ def test_explicit_consumer_epoch_barrier_avoids_duplicate():
 def test_explicit_consumer_epoch_barrier_rejects_insufficient_arrivals(capfd):
     with pytest.raises(RuntimeError, match="PassManager::run failed"):
         _compile_single_reader_with_explicit_epoch(epoch_arrivals=1)
-    assert (
-        "explicit consumer epoch barrier arrival count must equal the total "
-        "consumer warp count (16)" in capfd.readouterr().err
-    )
+    assert ("explicit consumer epoch barrier arrival count must equal the total "
+            "consumer warp count (16)" in capfd.readouterr().err)
 
 
 @pytest.mark.parametrize("hazard_kind", [0, 1, 2], ids=["war", "non_pipe_waw", "raw"])
