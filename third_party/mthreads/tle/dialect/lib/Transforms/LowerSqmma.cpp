@@ -118,6 +118,20 @@ static ttg::LocalAllocOp findRootAlloc(Value value) {
   while (value && visited.insert(value.getAsOpaquePointer()).second) {
     if (auto alloc = value.getDefiningOp<ttg::LocalAllocOp>())
       return alloc;
+    // An explicit warp-specialize capture is represented inside every
+    // isolated partition by a block argument at the same ordinal as the
+    // capture on WarpSpecializePartitionsOp.  Recover the parent SSA value so
+    // SQMMA layout inference can continue to the underlying local_alloc.
+    if (auto blockArg = dyn_cast<BlockArgument>(value)) {
+      Block *block = blockArg.getOwner();
+      auto partitions = dyn_cast_or_null<ttg::WarpSpecializePartitionsOp>(
+          block->getParentOp());
+      if (partitions &&
+          blockArg.getArgNumber() < partitions.getExplicitCaptures().size()) {
+        value = partitions.getExplicitCaptures()[blockArg.getArgNumber()];
+        continue;
+      }
+    }
     Operation *def = value.getDefiningOp();
     if (auto index = dyn_cast_or_null<ttg::MemDescIndexOp>(def))
       value = index.getSrc();

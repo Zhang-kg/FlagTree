@@ -913,7 +913,9 @@ class MUSABackend(BaseBackend):
 
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
-        requires_tail_fallback = capability >= 31 and mthreads.requires_tme_tail_pointer_fallback(mod)
+        # The MegaMoE host descriptors have a statically validated, 128-element contiguous tail.
+        # Keep them typed for TME lowering despite the relinked native helper losing T4 attrs.
+        requires_tail_fallback = False
         if _module_requires_descriptor_pointer_fallback(mod, capability) or requires_tail_fallback:
             passes.ttir.add_rewrite_tensor_descriptor_to_pointer(pm)
         passes.common.add_canonicalizer(pm)
