@@ -16,10 +16,14 @@
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
 #include "triton/Tools/LayoutUtils.h"
+#include "llvm/ADT/BitVector.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/PriorityWorklist.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/SmallVector.h"
 #include <algorithm>
 #include <unordered_set>
 
@@ -299,7 +303,7 @@ static void updateFunctionType(tt::FuncOp func) {
   func.setFunctionType(FunctionType::get(func.getContext(), argTys, resultTys));
 }
 
-static void assignMemoryLayouts(tt::FuncOp func) {
+static LogicalResult assignMemoryLayouts(tt::FuncOp func) {
   std::unordered_set<EncodingInfo> encodings;
   llvm::MapVector<TypedValue<tt::TensorDescType>, const EncodingInfo *>
       valueToEncodingInfo;
@@ -307,18 +311,80 @@ static void assignMemoryLayouts(tt::FuncOp func) {
   unsigned numCTAs =
       std::max(1u, static_cast<unsigned>(ttg::lookupNumCTAs(func)));
 
+  // All worker regions receive the same capture list, including captures that
+  // a particular worker does not use. Their descriptor types must therefore be
+  // updated together with the values captured from the enclosing scope.
+  SmallVector<SmallVector<Value>> wsCaptureGroups;
+  llvm::DenseMap<Value, SmallVector<unsigned>> valueToWsCaptureGroups;
+  bool invalidWsCapture = false;
+  func.walk([&](ttg::WarpSpecializePartitionsOp partitions) {
+    ValueRange captures = partitions.getExplicitCaptures();
+    for (auto [captureIndex, capture] : llvm::enumerate(captures)) {
+      if (!isa<tt::TensorDescType>(capture.getType()))
+        continue;
+
+      SmallVector<Value> group{capture};
+      bool validGroup = true;
+      for (Region &region : partitions.getPartitionRegions()) {
+        if (captureIndex >= region.getNumArguments()) {
+          partitions.emitOpError()
+              << "tensor descriptor capture #" << captureIndex
+              << " has no corresponding argument in a worker partition";
+          invalidWsCapture = true;
+          validGroup = false;
+          break;
+        }
+        Value argument = region.getArgument(captureIndex);
+        if (!isa<tt::TensorDescType>(argument.getType())) {
+          partitions.emitOpError()
+              << "tensor descriptor capture #" << captureIndex
+              << " corresponds to a non-descriptor worker argument";
+          invalidWsCapture = true;
+          validGroup = false;
+          break;
+        }
+        group.push_back(argument);
+      }
+      if (!validGroup)
+        continue;
+
+      unsigned groupIndex = wsCaptureGroups.size();
+      wsCaptureGroups.push_back(std::move(group));
+      for (Value value : wsCaptureGroups.back())
+        valueToWsCaptureGroups[value].push_back(groupIndex);
+    }
+  });
+  if (invalidWsCapture)
+    return failure();
+
+  auto expandWsCaptureGroups =
+      [&](ArrayRef<Value> descValues) -> SmallVector<Value> {
+    llvm::SetVector<Value> expanded(descValues.begin(), descValues.end());
+    for (unsigned index = 0; index < expanded.size(); ++index) {
+      auto membership = valueToWsCaptureGroups.find(expanded[index]);
+      if (membership == valueToWsCaptureGroups.end())
+        continue;
+      for (unsigned groupIndex : membership->second) {
+        for (Value tiedValue : wsCaptureGroups[groupIndex])
+          expanded.insert(tiedValue);
+      }
+    }
+    return SmallVector<Value>(expanded.begin(), expanded.end());
+  };
+
   auto updateEncoding = [&](ArrayRef<Value> descValues, EncodingInfo info) {
-    for (Value value : descValues) {
+    SmallVector<Value> expandedDescValues = expandWsCaptureGroups(descValues);
+
+    for (Value value : expandedDescValues) {
       auto typedVal = cast<TypedValue<tt::TensorDescType>>(value);
       auto it = valueToEncodingInfo.find(typedVal);
-      if (it != valueToEncodingInfo.end()) {
+      if (it != valueToEncodingInfo.end())
         info = combineEncodings(*it->second, info,
                                 typedVal.getType().getBlockType().getRank());
-      }
     }
 
     auto *einfo = internEncoding(encodings, std::move(info));
-    for (Value value : descValues) {
+    for (Value value : expandedDescValues) {
       auto typedVal = cast<TypedValue<tt::TensorDescType>>(value);
       auto res = valueToEncodingInfo.try_emplace(typedVal, einfo);
       if (res.second) {
@@ -367,6 +433,12 @@ static void assignMemoryLayouts(tt::FuncOp func) {
         seedEncoding(desc);
     }
   });
+
+  // seedEncoding does not enqueue ordinary descriptor definitions/operands.
+  // Seed each capture group explicitly as well, so even completely unused
+  // captures and their unused worker arguments receive identical types.
+  for (ArrayRef<Value> group : wsCaptureGroups)
+    updateEncoding(group, EncodingInfo{});
 
   while (!worklist.empty()) {
     auto desc = worklist.pop_back_val();
@@ -426,6 +498,7 @@ static void assignMemoryLayouts(tt::FuncOp func) {
         getTensorDescTypeWithEncoding(nullptr, descTy.getBlockType(), encoding);
   }
   func.setFunctionType(FunctionType::get(func.getContext(), argTys, resultTys));
+  return success();
 }
 
 static bool matchesExpandedTensorDescABI(Block &entry, unsigned descArgIdx,
@@ -561,7 +634,10 @@ struct TritonMUSAGPUOptimizeDescriptorEncodingPass
       auto func = dyn_cast<tt::FuncOp>(&op);
       if (!func)
         continue;
-      assignMemoryLayouts(func);
+      if (failed(assignMemoryLayouts(func))) {
+        signalPassFailure();
+        return;
+      }
       compactUnusedHostTensorDescABI(func);
     }
 

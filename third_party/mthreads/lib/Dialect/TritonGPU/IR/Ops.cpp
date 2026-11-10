@@ -1,3 +1,4 @@
+#include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/Support/DebugStringHelper.h"
@@ -910,12 +911,38 @@ LogicalResult TMACopyOp::verify() {
   if (globalToLocal && !memDescTy.getMutableMemory())
     return emitOpError("cannot copy into immutable memdesc");
 
+  // This backend-private marker is produced by MThreads pipe lowering for a
+  // secondary copy whose bytes/arrival are registered by its writer's first
+  // copy. Keep the IR verifier independent of the TME lowering utility header.
+  Attribute skipAccounting =
+      (*this)->getAttr("musa_tle.skip_transaction_accounting");
+  if (skipAccounting && (*this)->hasAttr("expect_bytes"))
+    return emitOpError(
+        "expect_bytes and skip_transaction_accounting are mutually exclusive");
+  if (skipAccounting && !isa<UnitAttr>(skipAccounting))
+    return emitOpError(
+        "skip_transaction_accounting must be a unit attribute");
+  if (skipAccounting && (!globalToLocal || !getCompletionBarrier()))
+    return emitOpError("skip_transaction_accounting requires a "
+                       "global-to-local copy with an explicit completion "
+                       "barrier");
+  if (skipAccounting) {
+    auto module = (*this)->getParentOfType<ModuleOp>();
+    auto target =
+        module ? module->getAttrOfType<StringAttr>("ttg.target") : StringAttr();
+    if (!target || !target.getValue().starts_with("musa:"))
+      return emitOpError(
+          "skip_transaction_accounting is only supported for a MUSA target");
+  }
+
   if (getCompletionBarrier()) {
     if (!globalToLocal)
       return emitOpError(
           "completion barrier is only supported for global-to-shared copy");
     auto expectBytes = (*this)->getAttrOfType<IntegerAttr>("expect_bytes");
-    if (!expectBytes || expectBytes.getInt() <= 0)
+    if (!skipAccounting &&
+        (!expectBytes || !expectBytes.getType().isInteger(32) ||
+         expectBytes.getInt() <= 0))
       return emitOpError(
           "completion barrier requires a positive expect_bytes attribute");
   } else if ((*this)->getAttr("expect_bytes")) {

@@ -175,6 +175,19 @@ static LogicalResult lowerTMACopy(ttg::TMACopyOp op, RewriterBase &rewriter) {
                           "shared memdesc operand");
   }
 
+  Attribute skipAccounting =
+      op->getAttr(triton::musa::kTLESkipTransactionAccountingAttr);
+  if (skipAccounting && op->hasAttr("expect_bytes"))
+    return op.emitOpError(
+        "expect_bytes and skip_transaction_accounting are mutually exclusive");
+  if (skipAccounting && !isa<UnitAttr>(skipAccounting))
+    return op.emitOpError(
+        "skip_transaction_accounting must be a unit attribute");
+  if (skipAccounting && (!globalToLocal || !op.getCompletionBarrier()))
+    return op.emitOpError("skip_transaction_accounting requires a "
+                          "global-to-local copy with an explicit completion "
+                          "barrier");
+
   auto descTy = globalToLocal ? srcDescTy : dstDescTy;
   auto memDescTy = globalToLocal ? dstMemDescTy : srcMemDescTy;
   auto descBlockTy = descTy.getSignlessBlockType();
@@ -204,14 +217,21 @@ static LogicalResult lowerTMACopy(ttg::TMACopyOp op, RewriterBase &rewriter) {
     // do not allocate a hidden per-copy barrier here.
     if (Value completionBarrier = op.getCompletionBarrier()) {
       auto expectBytes = op->getAttrOfType<IntegerAttr>("expect_bytes");
-      if (!expectBytes || expectBytes.getInt() <= 0)
+      if (!skipAccounting &&
+          (!expectBytes || !expectBytes.getType().isInteger(32) ||
+           expectBytes.getInt() <= 0))
         return op.emitOpError(
             "completion barrier requires positive expect_bytes");
       auto asyncCopy = triton::musa::createAsyncTMECopyGlobalToLocal(
           rewriter, loc, op.getSrc(), *coord, completionBarrier, op.getDst(),
           pred, *config);
-      asyncCopy->setAttr("musa_tle.expect_bytes",
-                         rewriter.getI32IntegerAttr(expectBytes.getInt()));
+      if (skipAccounting) {
+        asyncCopy->setAttr(triton::musa::kTLESkipTransactionAccountingAttr,
+                           skipAccounting);
+      } else {
+        asyncCopy->setAttr(triton::musa::kTLEExpectBytesAttr,
+                           rewriter.getI32IntegerAttr(expectBytes.getInt()));
+      }
       rewriter.eraseOp(op);
       return success();
     }

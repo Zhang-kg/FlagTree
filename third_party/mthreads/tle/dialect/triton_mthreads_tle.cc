@@ -404,6 +404,11 @@ void init_triton_musa_tle_ir(py::module m) {
 
              return self.create<ttg::MemDescIndexOp>(resultType, src, index);
            })
+      .def("create_memdesc_subslice",
+           [](TritonOpBuilder &self, mlir::Type resultType, mlir::Value src,
+              std::vector<int32_t> &offsets) -> mlir::Value {
+             return self.create<ttg::MemDescSubsliceOp>(resultType, src, offsets);
+           })
       .def("create_memdesc_trans",
            [](TritonOpBuilder &self, mlir::Value src,
               std::vector<int> order) -> mlir::Value {

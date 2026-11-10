@@ -893,22 +893,42 @@ def _assert_late_ws_dot_cfg(late, stages):
         r"(%[-\w.]+),\s*(%[-\w.]+)",
         late,
     )
-    producer = [comparison for comparison in comparisons if comparison[1] == "uge"]
-    consumer = [comparison for comparison in comparisons if comparison[1] == "ult"]
-    assert len(producer) == 1, late
-    assert len(consumer) == 1, late
-    assert producer[0][2:] == consumer[0][2:], (producer, consumer, late)
+    assert len(comparisons) == 2, late
+    consumer, producer = comparisons
+    assert consumer[1] == producer[1] == "ult", comparisons
+    assert consumer[2] == producer[2], (producer, consumer, late)
     constants = _constants(late)
-    assert constants[producer[0][3]] == 16 * 32, (producer, constants, late)
-    assert late.index(producer[0][0]) < late.index(consumer[0][0]), late
-    assert re.search(rf"cf\.cond_br\s+{re.escape(producer[0][0])},", late), late
-    assert re.search(rf"cf\.cond_br\s+{re.escape(consumer[0][0])},", late), late
+    assert constants[consumer[3]] == 16 * 32, (consumer, constants, late)
+    assert constants[producer[3]] == 20 * 32, (producer, constants, late)
+    assert late.index(consumer[0]) < late.index(producer[0]), late
+    assert re.search(
+        rf'{re.escape(consumer[2])}\s*=\s*llvm\.call_intrinsic\s+'
+        r'"llvm\.musa\.read\.ptx\.sreg\.tid\.x"\(\)',
+        late,
+    ), late
+    consumer_branch = re.search(
+        rf"cf\.cond_br\s+{re.escape(consumer[0])},\s*(\^[-\w.]+),\s*(\^[-\w.]+)",
+        late,
+    )
+    assert consumer_branch, late
+    # The default's false edge must lead to the next upper-bound check;
+    # dispatches are a contiguous range chain, not independent predicates.
+    worker_dispatch = re.search(
+        rf"{re.escape(consumer_branch.group(2))}:.*?"
+        rf"{re.escape(producer[0])}\s*=\s*arith\.cmpi\s+ult,.*?"
+        rf"cf\.cond_br\s+{re.escape(producer[0])},",
+        late,
+        re.DOTALL,
+    )
+    assert worker_dispatch, late
     # Two partition dispatches plus the thread-0-only barrier initializer.
     assert late.count("cf.cond_br") == 3, late
 
-    # The pre-existing post-initialization CTA rendezvous is reused.  The
-    # static dispatch and partition barriers must not allocate control SMEM.
-    assert late.count('"llvm.musa.syncthreads.lm"') == 1, late
+    # The only CTA rendezvous are the common post-initialization entry and
+    # final join. Role-internal syncs use each role's own reusable barrier,
+    # never a CTA barrier; neither dispatch nor role sync needs control SMEM.
+    assert late.count('"llvm.musa.syncthreads.lm"') == 2, late
+    assert '"llvm.musa.barrier0"' not in late, late
     initialized_barriers = late.count('"llvm.musa.async.init.arrival"')
     record = re.search(
         r'llvm\.call_intrinsic\s+"llvm\.musa\.async\.bar\.record"'
@@ -918,7 +938,40 @@ def _assert_late_ws_dot_cfg(late, stages):
     assert record, late
     recorded_barriers = constants[record.group(1)]
     assert recorded_barriers == initialized_barriers, (record.group(1), constants, late)
-    assert recorded_barriers > 4 * stages, (recorded_barriers, stages, late)
+    assert recorded_barriers == 4 * stages + 2, (recorded_barriers, stages, late)
+
+    role_initializers = {}
+    for match in re.finditer(
+        r'llvm\.call_intrinsic\s+"llvm\.musa\.async\.init\.arrival"'
+        r'\((%[-\w.]+),\s*(%[-\w.]+),\s*(%[-\w.]+)\)',
+        late,
+    ):
+        barrier, count, phase = match.groups()
+        if barrier not in constants:
+            continue
+        role_initializers[constants[barrier]] = (constants[count], constants[phase])
+        assert match.start() < late.index('"llvm.musa.syncthreads.lm"'), late
+    # Arrival counts are converged warps (16 and 4), never lane counts.
+    assert role_initializers == {4 * stages + 1: (16, 0), 4 * stages + 2: (4, 0)}, late
+
+    role_sync_ids = set()
+    for phase, barrier in re.findall(
+        r'(%[-\w.]+)\s*=\s*llvm\.call_intrinsic\s+"llvm\.musa\.async\.arrive"'
+        r'\((%[-\w.]+)\)',
+        late,
+    ):
+        # TME completion now also uses phase-returning async.arrive, but only
+        # the role-local arrivals are paired with a wait on their own token.
+        barrier_id = constants.get(barrier)
+        if barrier_id not in role_initializers:
+            continue
+        role_sync_ids.add(barrier_id)
+        assert re.search(
+            r'llvm\.call_intrinsic\s+"llvm\.musa\.async\.wait"'
+            rf'\({re.escape(barrier)},\s*{re.escape(phase)}\)',
+            late,
+        ), late
+    assert role_sync_ids == set(role_initializers), late
 
 
 @pytest.mark.parametrize("stages,k_tiles", [(1, 16), (2, 16), (2, 10)])

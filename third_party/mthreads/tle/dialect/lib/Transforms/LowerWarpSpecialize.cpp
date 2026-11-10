@@ -8,6 +8,8 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include <cstdint>
 #include <limits>
@@ -47,40 +49,60 @@ class PrepareWarpSpecializePass
           "mthreads TLE static warp_specialize does not support results");
 
     auto partitions = ws.getPartitionOp();
-    if (partitions.getPartitionRegions().size() != 1)
+    auto partitionRegions = partitions.getPartitionRegions();
+    ArrayRef<int32_t> partitionNumWarps = ws.getPartitionNumWarps();
+    if (partitionRegions.empty())
       return ws.emitOpError(
-          "mthreads TLE static warp_specialize requires exactly one producer "
+          "mthreads TLE static warp_specialize requires at least one worker "
           "partition");
-    if (ws.getPartitionNumWarps().size() != 1 ||
-        ws.getPartitionNumWarps().front() <= 0)
+    if (partitionRegions.size() != partitionNumWarps.size())
       return ws.emitOpError(
-          "mthreads TLE static warp_specialize requires a positive static "
-          "producer warp count");
+          "mthreads TLE static warp_specialize worker region and warp-count "
+          "sizes must match");
 
-    Region &consumerRegion = ws.getDefaultRegion();
-    Region &producerRegion = partitions.getPartitionRegions().front();
-    if (!consumerRegion.hasOneBlock() || !producerRegion.hasOneBlock())
+    Region &defaultRegion = ws.getDefaultRegion();
+    if (!defaultRegion.hasOneBlock())
       return ws.emitOpError(
           "mthreads TLE static warp_specialize requires single-block "
-          "consumer and producer regions");
+          "default and worker regions");
 
-    Block &consumerBlock = consumerRegion.front();
-    Block &producerBlock = producerRegion.front();
-    auto consumerYield =
-        dyn_cast<ttg::WarpYieldOp>(consumerBlock.getTerminator());
-    if (!consumerYield || consumerYield.getNumOperands() != 0)
+    Block &defaultBlock = defaultRegion.front();
+    auto defaultYield =
+        dyn_cast<ttg::WarpYieldOp>(defaultBlock.getTerminator());
+    if (!defaultYield || defaultYield.getNumOperands() != 0)
       return ws.emitOpError(
-          "mthreads TLE static warp_specialize consumer must yield no values");
-    if (!isa<ttg::WarpReturnOp>(producerBlock.getTerminator()))
-      return ws.emitOpError(
-          "mthreads TLE static warp_specialize producer must end with "
-          "ttg.warp_return");
+          "mthreads TLE static warp_specialize default region must yield no "
+          "values");
 
     ValueRange captures = partitions.getExplicitCaptures();
-    if (producerBlock.getNumArguments() != captures.size())
-      return ws.emitOpError(
-          "mthreads TLE static warp_specialize producer capture count "
-          "mismatch");
+    for (auto [index, region] : llvm::enumerate(partitionRegions)) {
+      if (partitionNumWarps[index] <= 0)
+        return ws.emitOpError()
+               << "mthreads TLE static warp_specialize worker " << index
+               << " must have a positive static warp count";
+      if (!region.hasOneBlock())
+        return ws.emitOpError() << "mthreads TLE static warp_specialize worker "
+                                << index << " must have exactly one block";
+
+      Block &workerBlock = region.front();
+      auto workerReturn =
+          dyn_cast<ttg::WarpReturnOp>(workerBlock.getTerminator());
+      if (!workerReturn || workerReturn->getNumOperands() != 0)
+        return ws.emitOpError()
+               << "mthreads TLE static warp_specialize worker " << index
+               << " must end with ttg.warp_return with no values";
+      if (workerBlock.getNumArguments() != captures.size())
+        return ws.emitOpError() << "mthreads TLE static warp_specialize worker "
+                                << index << " capture count mismatch";
+      for (auto [argument, capture] :
+           llvm::zip(workerBlock.getArguments(), captures)) {
+        if (argument.getType() != capture.getType())
+          return ws.emitOpError()
+                 << "mthreads TLE static warp_specialize worker " << index
+                 << " capture type mismatch";
+      }
+    }
+
     DominanceInfo dominance(func);
     for (Value capture : captures) {
       if (!dominance.dominates(capture, ws.getOperation()))
@@ -92,30 +114,37 @@ class PrepareWarpSpecializePass
     int32_t baseNumWarps = ttg::lookupNumWarps(ws);
     if (baseNumWarps <= 0)
       return ws.emitOpError(
-          "mthreads TLE static warp_specialize consumer warp count must be "
+          "mthreads TLE static warp_specialize default warp count must be "
           "positive");
-    int32_t producerWarps = ws.getPartitionNumWarps().front();
     int32_t warpSize = ttg::TritonGPUDialect::getThreadsPerWarp(mod);
-    int64_t totalNumWarps64 =
-        static_cast<int64_t>(baseNumWarps) + producerWarps;
-    int64_t producerBegin64 = static_cast<int64_t>(baseNumWarps) * warpSize;
+    if (warpSize <= 0)
+      return ws.emitOpError(
+          "mthreads TLE static warp_specialize warp size must be positive");
+
+    int64_t totalNumWarps64 = baseNumWarps;
+    SmallVector<int32_t> expectedStartIds;
+    expectedStartIds.reserve(partitionNumWarps.size());
+    for (int32_t workerWarps : partitionNumWarps) {
+      if (totalNumWarps64 > std::numeric_limits<int32_t>::max())
+        return ws.emitOpError(
+            "mthreads TLE static warp_specialize warp count overflow");
+      expectedStartIds.push_back(static_cast<int32_t>(totalNumWarps64));
+      totalNumWarps64 += workerWarps;
+    }
     int64_t totalThreads64 = totalNumWarps64 * warpSize;
-    if (warpSize <= 0 ||
-        totalNumWarps64 > std::numeric_limits<int32_t>::max() ||
-        producerBegin64 > std::numeric_limits<int32_t>::max() ||
+    if (totalNumWarps64 > std::numeric_limits<int32_t>::max() ||
         totalThreads64 > std::numeric_limits<int32_t>::max())
       return ws.emitOpError(
           "mthreads TLE static warp_specialize thread count overflow");
 
     int32_t totalNumWarps = static_cast<int32_t>(totalNumWarps64);
     if (auto existingStartIds = ws.getWarpGroupStartIds()) {
-      if (existingStartIds->size() != 1 ||
-          existingStartIds->front() != baseNumWarps)
+      if (!llvm::equal(*existingStartIds, expectedStartIds))
         return ws.emitOpError(
-            "mthreads TLE static producer must begin after the default "
-            "partition");
+            "mthreads TLE static worker start ids must form contiguous "
+            "ranges after the default partition");
     } else {
-      ws.setWarpGroupStartIds({baseNumWarps});
+      ws.setWarpGroupStartIds(expectedStartIds);
     }
     if (auto existing =
             mod->getAttrOfType<IntegerAttr>("ttg.total-num-warps")) {

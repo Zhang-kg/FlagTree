@@ -200,7 +200,8 @@ def test_mthreads_tle_consumer_arrival_is_warp_convergent_in_llvm(tmp_path):
     llir = module.str_nodebug()
 
     assert llir.count('llvm.call_intrinsic "llvm.musa.async.wait"') == 1, llir
-    assert llir.count('llvm.call_intrinsic "llvm.musa.async.arrive.none.phaseid"') == 1, llir
+    assert llir.count('llvm.call_intrinsic "llvm.musa.async.arrive"') == 1, llir
+    assert "llvm.musa.async.arrive.none.phaseid" not in llir, llir
     assert "gpu.thread_id" not in llir, llir
     assert "llvm.musa.read.ptx.sreg.tid.x" not in llir, llir
 
@@ -216,7 +217,8 @@ def test_mthreads_tle_completion_copy_phase_reuse_compiles_to_mubin(stages):
     assert ttgir.count("ttmg.warp_arrive_barrier") == 4 * stages, ttgir
     assert ttgir.count("ttmg.arrive_barrier_noret") == 4 * stages, ttgir
     assert "llvm.musa.async.wait" in llir, llir
-    assert "llvm.musa.async.arrive.none.phaseid" in llir, llir
+    assert "@llvm.musa.async.arrive(" in llir, llir
+    assert "llvm.musa.async.arrive.none.phaseid" not in llir, llir
     assert "llvm.musa.tme.ld.tile.1d" in llir, llir
     assert re.search(r"\bphi\s+i64\b", llir) is None, llir
     assert compiled.asm["mubin"], compiled.asm.keys()
@@ -244,7 +246,8 @@ def test_mthreads_tle_completion_copy_single_slot_compiles_to_mubin(stages, slot
     assert ttgir.count("ttmg.arrive_barrier_noret") == 1, ttgir
     assert "llvm.musa.async.wait" in llir, llir
     assert "llvm.musa.async.arrive" in llir, llir
-    assert "llvm.musa.async.arrive.none.phaseid" in llir, llir
+    assert "@llvm.musa.async.arrive(" in llir, llir
+    assert "llvm.musa.async.arrive.none.phaseid" not in llir, llir
     assert "llvm.musa.tme.ld.tile.1d" in llir, llir
     assert compiled.asm["mubin"], compiled.asm.keys()
 

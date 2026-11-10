@@ -69,6 +69,81 @@ def _ws_simple_kernel(out):
 
 
 @triton.jit
+def _ws_marker_role(out, OFFSET: tl.constexpr, MARKER: tl.constexpr):
+    tl.store(out + OFFSET, MARKER)
+
+
+@triton.jit
+def _ws_four_role_kernel(out):
+    tle.gpu.warp_specialize(
+        [
+            (_ws_marker_role, (out, 0, 101)),
+            (_ws_marker_role, (out, 1, 202)),
+            (_ws_marker_role, (out, 2, 303)),
+            (_ws_marker_role, (out, 3, 404)),
+        ],
+        worker_num_warps=[2, 1, 1],
+        worker_num_regs=[24, 24, 24],
+    )
+
+
+@triton.jit
+def _ws_repeated_barrier_role(
+    out,
+    OFFSET: tl.constexpr,
+    MARKER: tl.constexpr,
+    ITERATIONS: tl.constexpr,
+):
+    iteration = 0
+    while iteration < ITERATIONS:
+        tl.debug_barrier()
+        iteration += 1
+    tl.store(out + OFFSET, MARKER)
+
+
+@triton.jit
+def _ws_four_role_barrier_kernel(out, ITERATIONS: tl.constexpr):
+    tle.gpu.warp_specialize(
+        [
+            (_ws_repeated_barrier_role, (out, 0, 11, ITERATIONS)),
+            (_ws_repeated_barrier_role, (out, 1, 22, ITERATIONS)),
+            (_ws_repeated_barrier_role, (out, 2, 33, ITERATIONS)),
+            (_ws_repeated_barrier_role, (out, 3, 44, ITERATIONS)),
+        ],
+        worker_num_warps=[2, 1, 1],
+        worker_num_regs=[24, 24, 24],
+    )
+
+
+@triton.jit
+def _ws_capture_worker(out, value, shared):
+    tl.store(out, value + shared)
+
+
+@triton.jit
+def _ws_multi_role_capture_kernel(
+    default_out,
+    out0,
+    out1,
+    out2,
+    value0,
+    value1,
+    value2,
+    shared,
+):
+    tle.gpu.warp_specialize(
+        [
+            (_ws_simple_default, (default_out, )),
+            (_ws_capture_worker, (out0, value0, shared)),
+            (_ws_capture_worker, (out1, value1, shared)),
+            (_ws_capture_worker, (out2, value2, shared)),
+        ],
+        worker_num_warps=[2, 1, 1],
+        worker_num_regs=[24, 24, 24],
+    )
+
+
+@triton.jit
 def _ws_dynamic_warps_kernel(out, worker_warps):
     tle.gpu.warp_specialize(
         [(_ws_simple_default, (out, )), (_ws_simple_worker, (out, ))],
@@ -343,7 +418,8 @@ def _assert_prepared_ws_ttgir(ir_text, consumer_warps=16, producer_warps=4):
 
 
 def _assert_static_ws_late_ir(ir_text, consumer_warps=16, producer_warps=4):
-    producer_begin = consumer_warps * 32
+    default_end = consumer_warps * 32
+    worker_end = (consumer_warps + producer_warps) * 32
     assert "ttg.warp_specialize" not in ir_text, ir_text
     assert "ttg.warp_yield" not in ir_text, ir_text
     assert "ttg.warp_return" not in ir_text, ir_text
@@ -351,21 +427,75 @@ def _assert_static_ws_late_ir(ir_text, consumer_warps=16, producer_warps=4):
     dispatch = re.search(
         rf'(?P<tid>%[-\w.]+) = llvm\.call_intrinsic '
         rf'"llvm\.musa\.read\.ptx\.sreg\.tid\.x"\(\).*?'
-        rf'arith\.constant {producer_begin} : i32.*?'
-        rf'arith\.cmpi uge, (?P=tid),',
+        rf'arith\.constant {default_end} : i32.*?'
+        rf'arith\.cmpi ult, (?P=tid),',
         ir_text,
         re.DOTALL,
     )
     assert dispatch, ir_text
-    assert re.search(rf"arith\.cmpi ult, {re.escape(dispatch.group('tid'))},", ir_text), ir_text
-    assert ir_text.count("arith.cmpi uge") == 1, ir_text
-    assert ir_text.count("arith.cmpi ult") == 1, ir_text
+    assert ir_text.count("arith.cmpi uge") == 0, ir_text
+    assert ir_text.count("arith.cmpi ult") == 2, ir_text
     assert ir_text.count("cf.cond_br") == 2, ir_text
-    assert re.search(rf"arith\.constant {producer_begin} : i32", ir_text), ir_text
-    assert ir_text.index("arith.cmpi uge") < ir_text.index("arith.cmpi ult"), ir_text
+    assert re.search(rf"arith\.constant {default_end} : i32", ir_text), ir_text
+    assert re.search(rf"arith\.constant {worker_end} : i32", ir_text), ir_text
     assert "llvm.switch" not in ir_text, ir_text
     assert "musa_tle.static_ws." not in ir_text, ir_text
     assert "builtin.unrealized_conversion_cast" not in ir_text, ir_text
+
+
+def _assert_four_role_ttgir(ir_text):
+    assert '"ttg.total-num-warps" = 8 : i32' in ir_text, ir_text
+    assert re.search(
+        r"warpGroupStartIds\s*=\s*array<i32:\s*4,\s*6,\s*7>", ir_text
+    ), ir_text
+    assert re.findall(r"\bpartition(\d+)\(", ir_text) == ["0", "1", "2"], ir_text
+    assert ir_text.count("ttg.warp_yield") == 1, ir_text
+    assert ir_text.count("ttg.warp_return") == 3, ir_text
+    assert "musa_tle.static_warp_specialize" in ir_text, ir_text
+
+
+def _assert_multi_role_capture_remap(ir_text):
+    ws_match = re.search(r"ttg\.warp_specialize\((?P<captures>[^)]*)\)", ir_text)
+    assert ws_match, ir_text
+    captures = _split_top_level(ws_match.group("captures"))
+
+    # Worker arguments are (unique pointer, unique scalar, shared scalar).
+    # Across three workers this must flatten to 3 + 3 + 1 captures, rather
+    # than retaining three copies of the shared scalar.
+    assert len(captures) == 7, ir_text
+
+    expected_used_indices = ({0, 1, 2}, {3, 4, 2}, {5, 6, 2})
+    expected_warps = (2, 1, 1)
+    expected_type_kinds = ("ptr", "i32", "i32", "ptr", "i32", "ptr", "i32")
+    for index, (used_indices, worker_warps) in enumerate(
+        zip(expected_used_indices, expected_warps)
+    ):
+        partition_match = re.search(
+            rf"\bpartition{index}\((?P<args>[^)]*)\)\s*"
+            rf"num_warps\({worker_warps}\)\s*\{{(?P<body>.*?)ttg\.warp_return",
+            ir_text,
+            re.DOTALL,
+        )
+        assert partition_match, ir_text
+        declarations = _split_top_level(partition_match.group("args"))
+        assert len(declarations) == 7, ir_text
+
+        arg_names = []
+        type_kinds = []
+        for declaration in declarations:
+            name, type_text = declaration.split(":", maxsplit=1)
+            arg_names.append(name.strip())
+            type_text = type_text.strip()
+            type_kinds.append("ptr" if "ptr" in type_text else type_text)
+        assert tuple(type_kinds) == expected_type_kinds, ir_text
+
+        body = partition_match.group("body")
+        actually_used = {
+            arg_index
+            for arg_index, arg_name in enumerate(arg_names)
+            if re.search(rf"{re.escape(arg_name)}(?![-\w.$])", body)
+        }
+        assert actually_used == used_indices, ir_text
 
 
 def test_tle_warp_specialize_mthreads_container_contract():
@@ -375,6 +505,83 @@ def test_tle_warp_specialize_mthreads_container_contract():
     _assert_ws_container(ttgir)
     _assert_prepared_ws_ttgir(ttgir)
     _assert_static_ws_late_ir(late_ir)
+
+
+def test_tle_warp_specialize_exact_four_role_runtime():
+    out = torch.zeros((4, ), dtype=torch.int32, device="musa")
+    compiled = _ws_four_role_kernel.warmup(
+        out,
+        grid=(1, ),
+        num_warps=4,
+        num_stages=1,
+    )
+    assert compiled.metadata.num_warps == 8
+    _assert_four_role_ttgir(compiled.asm["ttgir"])
+    assert "ttg.warp_specialize" not in compiled.asm["llir"]
+    assert '!"maxntidx", i32 256' in compiled.asm["llir"]
+
+    for _ in range(2):
+        out.zero_()
+        _ws_four_role_kernel[(1, )](out, num_warps=4, num_stages=1)
+        torch.musa.synchronize()
+        expected = torch.tensor([101, 202, 303, 404], dtype=torch.int32)
+        torch.testing.assert_close(out.cpu(), expected)
+
+
+def test_tle_warp_specialize_repeated_role_local_barrier_runtime():
+    out = torch.zeros((4, ), dtype=torch.int32, device="musa")
+    compiled = _ws_four_role_barrier_kernel.warmup(
+        out,
+        ITERATIONS=32,
+        grid=(1, ),
+        num_warps=4,
+        num_stages=1,
+    )
+    llir = compiled.asm["llir"]
+    assert compiled.metadata.num_warps == 8
+    _assert_four_role_ttgir(compiled.asm["ttgir"])
+    assert "llvm.musa.async.init.arrival" in llir, llir
+    assert "llvm.musa.async.arrive" in llir, llir
+    assert "llvm.musa.async.wait" in llir, llir
+    assert "llvm.musa.syncwarp" in llir, llir
+    assert "llvm.musa.async.bar.record(i32 2)" in llir, llir
+
+    for _ in range(2):
+        out.zero_()
+        _ws_four_role_barrier_kernel[(1, )](
+            out,
+            ITERATIONS=32,
+            num_warps=4,
+            num_stages=1,
+        )
+        torch.musa.synchronize()
+        expected = torch.tensor([11, 22, 33, 44], dtype=torch.int32)
+        torch.testing.assert_close(out.cpu(), expected)
+
+
+def test_tle_warp_specialize_multi_role_capture_remap_compile():
+    signature = {
+        "default_out": "*i32",
+        "out0": "*i32",
+        "out1": "*i32",
+        "out2": "*i32",
+        "value0": "i32",
+        "value1": "i32",
+        "value2": "i32",
+        "shared": "i32",
+    }
+    ttir, ttgir, late_ir = _compile_ws_ir(
+        _ws_multi_role_capture_kernel,
+        signature,
+        constexprs={},
+        consumer_warps=4,
+        include_late=True,
+    )
+    _assert_multi_role_capture_remap(ttir)
+    _assert_four_role_ttgir(ttgir)
+    assert "tt.call" not in ttir, ttir
+    assert "ttg.warp_specialize" not in late_ir, late_ir
+    assert "builtin.unrealized_conversion_cast" not in late_ir, late_ir
 
 
 @pytest.mark.parametrize(

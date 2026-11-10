@@ -109,12 +109,18 @@ def TritonMUSAGPUTLELowerSqmma
 
 def TritonMUSAGPUTLELowerPipe
     : Pass<"tritonmusa-tle-lower-pipe", "mlir::ModuleOp"> {
-  let summary = "Lower single-field TME SPSC pipes to MUSA barriers";
+  let summary = "Lower multi-field TME pipes to MUSA barriers";
   let description = [{
-    Lower the initial mthreads tle.pipe contract: one CTA-scoped cyclic SPSC
-    field produced by one descriptor-to-shared TME transaction.  Materialize
-    independent full and empty hardware-barrier rings, bind TME completion to
-    the full barrier, and reject all unsupported pipe forms before rewriting.
+    Support CTA-local, single-reader pipes with multiple fields and disjoint
+    writer ownership. Each field is produced by one descriptor-to-shared TME
+    transaction per slot. Materialize one private full hardware-barrier ring
+    per writer plus one shared empty ring. Each full barrier counts its
+    writer's single arrival and all copy bytes; the reader waits for every
+    writer before consuming the slot. After a collective reader rendezvous,
+    only the reader's first physical warp publishes the empty generation.
+    Aggregate each writer's transaction bytes before its first copy, regardless
+    of the field declaration order.
+    Reject unsupported pipe forms and invalid lifecycle pairs before rewriting.
   }];
   let dependentDialects = [
     "mlir::arith::ArithDialect",
@@ -129,7 +135,7 @@ def TritonMUSAGPUTLEPrepareWarpSpecialize
     : Pass<"tritonmusa-tle-prepare-warp-specialize", "mlir::ModuleOp"> {
   let summary = "Validate mthreads TLE static warp specialization";
   let description = [{
-    Validate the restricted single-producer/single-consumer contract and
+    Validate the terminal static N-role specialization contract and
     publish the total launch warp count while retaining ttg.warp_specialize for
     shared-memory allocation and late LLVM lowering.
   }];
@@ -144,8 +150,9 @@ def TritonMUSAGPUTLELowerWarpSpecialize
   let summary = "Late-lower mthreads TLE static warp specialization";
   let description = [{
     Lower warp-group barriers directly from the retained default and partition
-    regions, then replace the restricted warp-specialize operation with two
-    independent static CFG branches.  The lowering uses hardware barrier ids
+    regions, then replace the warp-specialize operation with a thread-range
+    branch chain covering the default and all worker roles. The lowering uses
+    hardware barrier ids
     and direct SSA captures, so it allocates no control shared memory.
   }];
   let dependentDialects = [
@@ -183,11 +190,13 @@ def TritonMUSAGPUTLELowerTMETransactions
     : Pass<"tritonmusa-tle-lower-tme-transactions", "mlir::ModuleOp"> {
   let summary = "Materialize explicit MUSA TME completion transactions";
   let description = [{
-    Replace the temporary transaction-byte marker on each explicit TLE
-    completion copy with one barrier add-transaction before the copy and one
-    issuer arrival after it.  Mark all three issue operations with the same raw
-    CTA issuer thread and suppress the legacy CTA-wide synchronization inside
-    explicit-completion TME lowering.
+    Replace a temporary transaction-byte marker with one barrier
+    add-transaction and one issuer arrival before the marked copy. Subsequent
+    copies in a grouped writer commit share this completion but do not repeat
+    the accounting. Pending transaction bytes prevent premature completion.
+    Mark every issue operation with the same physical CTA issue-warp start
+    and suppress the legacy CTA-wide synchronization inside explicit-completion
+    TME lowering. Remove both temporary accounting markers after lowering.
   }];
   let dependentDialects = [
     "mlir::arith::ArithDialect",
@@ -205,7 +214,7 @@ def TritonMUSAGPUTLELowerBarrierOperations
     corresponding MUSA hardware barrier operations after logical barrier
     ranges have been assigned physical ids.  Consumer arrivals remain
     convergent warp-level operations and are deliberately kept separate from
-    the single-issuer TME transaction arrival path.
+    the single-issue-warp TME transaction arrival path.
   }];
   let dependentDialects = [
     "mlir::triton::musa::MUSADialect",

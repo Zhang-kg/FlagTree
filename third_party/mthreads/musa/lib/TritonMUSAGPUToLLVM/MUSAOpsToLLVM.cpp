@@ -208,6 +208,22 @@ std::optional<int64_t> inferElemBytesFromMemDesc(Type type) {
 }
 
 #ifdef __TLE__
+bool isOutsideStaticWarpSpecialize(Operation *op) {
+  if (!op || op->getParentOfType<triton::gpu::WarpSpecializeOp>())
+    return false;
+  Operation *func = op->getParentOp();
+  while (func && !isa<triton::FuncOp, LLVM::LLVMFuncOp>(func))
+    func = func->getParentOp();
+  if (!func)
+    return false;
+
+  bool hasStaticWarpSpecialize = false;
+  func->walk([&](triton::gpu::WarpSpecializeOp ws) {
+    hasStaticWarpSpecialize |= ws->hasAttr("musa_tle.static_warp_specialize");
+  });
+  return hasStaticWarpSpecialize;
+}
+
 Value buildTMEIssuePredicate(Value userPred, Location loc,
                              ConversionPatternRewriter &rewriter,
                              Operation *issueOp = nullptr) {
@@ -226,6 +242,18 @@ Value buildTMEIssuePredicate(Value userPred, Location loc,
     threadId = ::mlir::gpu::ThreadIdOp::create(rewriter, loc,
                                                ::mlir::gpu::Dimension::x);
     threadId = arith::IndexCastOp::create(rewriter, loc, i32_ty, threadId);
+    // TME and transaction-barrier operations are warp-level instructions;
+    // only the first active lane issues them. Keep the elected producer warp
+    // converged instead of branching around these operations on one lane.
+    threadId = b.and_(threadId, b.i32_val(-32));
+  } else if (isOutsideStaticWarpSpecialize(issueOp)) {
+    // Common CTA setup also runs on the worker warps. getThreadId() masks
+    // the physical ID to the default partition's width, which would let
+    // multiple physical threads initialize the same hardware barrier.
+    threadId = LLVM::createLLVMIntrinsicCallOp(
+                   rewriter, loc, "llvm.musa.read.ptx.sreg.tid.x",
+                   TypeRange{rewriter.getI32Type()}, {})
+                   .getResult(0);
   } else {
     threadId = getThreadId(rewriter, loc);
   }
@@ -243,14 +271,21 @@ Value buildTMEIssuePredicate(Value userPred, Location loc,
 #endif // __TLE__
 
 Value buildTMEIssueOnlyPredicate(Location loc,
-                                 ConversionPatternRewriter &rewriter) {
+                                 ConversionPatternRewriter &rewriter,
+                                 Operation *issueOp = nullptr) {
   Value truePred = arith::ConstantIntOp::create(rewriter, loc, 1, 1);
+#ifdef __TLE__
+  return buildTMEIssuePredicate(truePred, loc, rewriter, issueOp);
+#else
+  (void)issueOp;
   return buildTMEIssuePredicate(truePred, loc, rewriter);
+#endif // __TLE__
 }
 
 void emitPredicatedVoidIntrinsic(ConversionPatternRewriter &rewriter,
                                  Location loc, Value pred, StringRef intrinsic,
-                                 ArrayRef<Value> operands) {
+                                 ArrayRef<Value> operands,
+                                 TypeRange discardedResultTypes = {}) {
   Block *currentBlock = rewriter.getInsertionBlock();
   Block *afterCall =
       rewriter.splitBlock(currentBlock, rewriter.getInsertionPoint());
@@ -258,7 +293,7 @@ void emitPredicatedVoidIntrinsic(ConversionPatternRewriter &rewriter,
   rewriter.setInsertionPointToEnd(currentBlock);
   LLVM::CondBrOp::create(rewriter, loc, pred, trueBlock, afterCall);
   rewriter.setInsertionPointToStart(trueBlock);
-  LLVM::createLLVMIntrinsicCallOp(rewriter, loc, intrinsic, TypeRange{},
+  LLVM::createLLVMIntrinsicCallOp(rewriter, loc, intrinsic, discardedResultTypes,
                                   operands);
   LLVM::BrOp::create(rewriter, loc, afterCall);
   rewriter.setInsertionPointToStart(afterCall);
@@ -455,7 +490,7 @@ struct InitArrivalOpConversion
                           .i32_val(static_cast<int32_t>(*numWarps));
     }
 
-    Value launchPred = buildTMEIssueOnlyPredicate(loc, rewriter);
+    Value launchPred = buildTMEIssueOnlyPredicate(loc, rewriter, op);
     SmallVector<Value> operands = {adaptor.getBarId(), arriveCount,
                                    adaptor.getPhaseId()};
     emitPredicatedVoidIntrinsic(rewriter, loc, launchPred,
@@ -521,6 +556,17 @@ struct ArriveBarrierNoRetOpConversion
     Value launchPred = buildTMEIssuePredicate(adaptor.getPred(), loc, rewriter);
 #endif // __TLE__
     SmallVector<Value> operands = {adaptor.getBarId()};
+#ifdef __TLE__
+    if (op->hasAttr(triton::musa::kTMEExplicitCompletionAttr)) {
+      // Match MP31 AsyncBarrier::arrive<false>: use the phase-returning
+      // arrival instruction even when the caller discards its result.
+      emitPredicatedVoidIntrinsic(rewriter, loc, launchPred,
+                                  "llvm.musa.async.arrive", operands,
+                                  TypeRange{rewriter.getI32Type()});
+      rewriter.eraseOp(op);
+      return success();
+    }
+#endif // __TLE__
     emitPredicatedVoidIntrinsic(rewriter, loc, launchPred,
                                 "llvm.musa.async.arrive.none.phaseid",
                                 operands);
@@ -538,10 +584,33 @@ struct WarpArriveBarrierOpConversion
   LogicalResult
   matchAndRewrite(triton::musa::WarpArriveBarrierOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    Attribute pipeEmpty = op->getAttr(triton::musa::kTLEPipeEmptyArrivalAttr);
+    if (pipeEmpty) {
+      auto issueThread = op->getAttrOfType<IntegerAttr>(
+          triton::musa::kTMEIssueThreadAttr);
+      if (!isa<UnitAttr>(pipeEmpty) || !issueThread ||
+          !issueThread.getType().isInteger(32) || issueThread.getInt() < 0 ||
+          issueThread.getInt() % 32 != 0)
+        return op.emitOpError(
+            "pipe empty arrival requires a unit marker and a non-negative, "
+            "warp-aligned i32 issue_thread");
+    }
     SmallVector<Value> operands = {adaptor.getBarId()};
-    LLVM::createLLVMIntrinsicCallOp(rewriter, op.getLoc(),
-                                    "llvm.musa.async.arrive.none.phaseid",
-                                    TypeRange{}, operands);
+    if (pipeEmpty) {
+      // The pipe's collective reader rendezvous has already completed. Elect
+      // its first full physical warp, not a single lane, for one empty arrival.
+      LLVM::createLLVMIntrinsicCallOp(rewriter, op.getLoc(),
+                                      "llvm.musa.syncwarp", TypeRange{},
+                                      ValueRange{});
+      Value launchPred = buildTMEIssueOnlyPredicate(op.getLoc(), rewriter, op);
+      emitPredicatedVoidIntrinsic(rewriter, op.getLoc(), launchPred,
+                                  "llvm.musa.async.arrive", operands,
+                                  TypeRange{rewriter.getI32Type()});
+    } else {
+      LLVM::createLLVMIntrinsicCallOp(rewriter, op.getLoc(),
+                                      "llvm.musa.async.arrive",
+                                      TypeRange{rewriter.getI32Type()}, operands);
+    }
     rewriter.eraseOp(op);
     return success();
   }

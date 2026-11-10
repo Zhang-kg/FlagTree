@@ -30,9 +30,7 @@ def is_backend_builder(builder) -> bool:
 def validate_pipe_options(scope, readers, one_shot, fields) -> None:
     if scope != "cta":
         raise ValueError("initial mthreads tle.pipe supports only scope='cta'")
-    if len(fields) != 1:
-        raise ValueError("initial mthreads tle.pipe requires exactly one payload field")
-    if readers is not None:
-        raise ValueError("initial mthreads tle.pipe supports only the default SPSC reader")
+    if readers is not None and len(readers) != 1:
+        raise ValueError("initial mthreads tle.pipe supports the default reader or exactly one named reader")
     if one_shot:
         raise ValueError("initial mthreads tle.pipe does not support one_shot=True")

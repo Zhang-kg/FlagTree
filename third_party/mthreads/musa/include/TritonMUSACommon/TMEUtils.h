@@ -35,6 +35,17 @@ inline constexpr llvm::StringLiteral kTMEExplicitCompletionAttr =
     "musa.tme.explicit_completion";
 inline constexpr llvm::StringLiteral kTLEExpectBytesAttr =
     "musa_tle.expect_bytes";
+// Backend-internal marker for a copy whose transaction bytes and producer
+// arrival are registered by an earlier copy in the same pipe writer commit.
+// It is mutually exclusive with expect_bytes and still requires the explicit
+// completion barrier and the writer's issue-thread predicate.
+inline constexpr llvm::StringLiteral kTLESkipTransactionAccountingAttr =
+    "musa_tle.skip_transaction_accounting";
+// Pipe-only empty publication after a collective reader rendezvous. The
+// accompanying issue_thread names the physical first thread of the one warp
+// that arrives; ordinary barrier arrivals retain their per-warp semantics.
+inline constexpr llvm::StringLiteral kTLEPipeEmptyArrivalAttr =
+    "musa_tle.pipe_empty_arrival";
 #endif // __TLE__
 
 enum class TMECopyKind {

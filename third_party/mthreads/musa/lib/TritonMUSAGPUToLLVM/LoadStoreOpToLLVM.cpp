@@ -167,7 +167,7 @@ applyPH1TMESwizzleToByteAddressValue(TritonLLVMOpBuilder &b, Value addrBytes,
 Value emitRedundantThreadPredicate(
     const llvm::MapVector<StringAttr, int32_t> &freeVarMasks,
     ConversionPatternRewriter &rewriter, Location loc,
-    const mlir::triton::MUSA::TargetInfo &targetInfo);
+    const mlir::triton::MUSA::TargetInfo &targetInfo, Operation *op);
 
 struct PH1SwizzledSharedAccess {
   Type llvmElemTy;
@@ -325,7 +325,8 @@ static LogicalResult lowerPH1SwizzledSharedStoreFromTensor(
   auto freeVarMasks = getFreeVariableMasks(regTy);
   uint32_t regMask = freeVarMasks.lookup(str_attr("reg"));
   Value threadPred =
-      emitRedundantThreadPredicate(freeVarMasks, rewriter, loc, targetInfo);
+      emitRedundantThreadPredicate(freeVarMasks, rewriter, loc, targetInfo,
+                                   diagnosticOp);
   Value pred = threadPred ? threadPred : b.true_val();
   for (auto [idx, coord] : llvm::enumerate(srcIndices)) {
     if (!isCanonicalIndex(static_cast<unsigned>(idx), regMask))
@@ -661,7 +662,7 @@ bool asyncCopyMaskNeedsPredicate(Value mask) {
 Value emitRedundantThreadPredicate(
     const llvm::MapVector<StringAttr, int32_t> &freeVarMasks,
     ConversionPatternRewriter &rewriter, Location loc,
-    const mlir::triton::MUSA::TargetInfo &targetInfo) {
+    const mlir::triton::MUSA::TargetInfo &targetInfo, Operation *op) {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   auto *ctx = rewriter.getContext();
   auto kLane = str_attr("lane");
@@ -690,6 +691,39 @@ Value emitRedundantThreadPredicate(
     Value dimPred = b.icmp_eq(b.and_(blockId, b.i32_val(blockMask)), zero);
     pred = maybeAnd(rewriter, loc, pred, dimPred);
   }
+
+#ifdef __TLE__
+  if (op && !op->getParentOfType<triton::gpu::WarpSpecializeOp>()) {
+    Operation *func = op->getParentOp();
+    while (func && !isa<triton::FuncOp, LLVM::LLVMFuncOp>(func))
+      func = func->getParentOp();
+    bool hasStaticWarpSpecialize = false;
+    if (func) {
+      func->walk([&](triton::gpu::WarpSpecializeOp ws) {
+        hasStaticWarpSpecialize |=
+            ws->hasAttr("musa_tle.static_warp_specialize");
+      });
+    }
+    if (hasStaticWarpSpecialize) {
+      // Common prologue layouts describe only the default partition. The
+      // local-ID mask repeats those indices on worker warps, so keep the
+      // existing layout predicate but exclude all physical worker threads
+      // from stores and atomics outside the specialized regions.
+      int numWarps = triton::gpu::lookupNumWarps(op);
+      int threadsPerWarp = triton::gpu::lookupThreadsPerWarp(rewriter);
+      Value rawThreadId = LLVM::createLLVMIntrinsicCallOp(
+                              rewriter, loc,
+                              "llvm.musa.read.ptx.sreg.tid.x",
+                              TypeRange{rewriter.getI32Type()}, {})
+                              .getResult(0);
+      Value defaultPred =
+          b.icmp_ult(rawThreadId, b.i32_val(numWarps * threadsPerWarp));
+      pred = maybeAnd(rewriter, loc, pred, defaultPred);
+    }
+  }
+#else
+  (void)op;
+#endif // __TLE__
 
   return pred;
 }
@@ -908,42 +942,24 @@ struct StoreOpConversion : public ConvertOpToLLVMPattern<triton::StoreOp> {
     auto freeVarMasks = getFreeVariableMasks(ptr.getType());
 #ifdef __TLE__
     Value threadPred =
-        emitRedundantThreadPredicate(freeVarMasks, rewriter, loc, targetInfo);
+        emitRedundantThreadPredicate(freeVarMasks, rewriter, loc, targetInfo,
+                                     op);
     if (!isa<RankedTensorType>(ptr.getType())) {
-      auto partitions =
-          op->getParentOfType<triton::gpu::WarpSpecializePartitionsOp>();
-      auto ws = partitions ? dyn_cast<triton::gpu::WarpSpecializeOp>(
-                                 partitions->getParentOp())
-                           : triton::gpu::WarpSpecializeOp();
+      auto ws = op->getParentOfType<triton::gpu::WarpSpecializeOp>();
       if (ws && ws->hasAttr("musa_tle.static_warp_specialize")) {
-        ModuleOp module = op->getParentOfType<ModuleOp>();
-        auto numWarps =
-            module->getAttrOfType<IntegerAttr>(triton::gpu::AttrNumWarpsName);
-        auto threadsPerWarp = module->getAttrOfType<IntegerAttr>(
-            triton::gpu::AttrNumThreadsPerWarp);
-        if (!numWarps || !threadsPerWarp || numWarps.getInt() <= 0 ||
-            threadsPerWarp.getInt() <= 0) {
-          return op.emitOpError(
-              "static WS partition store requires ttg.num-warps and "
-              "ttg.threads-per-warp");
-        }
-        if (numWarps.getInt() >
-            std::numeric_limits<int32_t>::max() / threadsPerWarp.getInt())
-          return op.emitOpError(
-              "static WS partition leader exceeds int32 range");
-        int64_t firstPartitionThread =
-            numWarps.getInt() * threadsPerWarp.getInt();
+        int roleStartThread =
+            getWarpGroupStartThreadId(op->getBlock()).value_or(0);
         Value rawThreadId = ::mlir::gpu::ThreadIdOp::create(
             rewriter, loc, ::mlir::gpu::Dimension::x);
         rawThreadId =
             arith::IndexCastOp::create(rewriter, loc, i32_ty, rawThreadId);
-        threadPred = b.icmp_eq(
-            rawThreadId, b.i32_val(static_cast<int32_t>(firstPartitionThread)));
+        threadPred = b.icmp_eq(rawThreadId, b.i32_val(roleStartThread));
       }
     }
 #else
     Value threadPred =
-        emitRedundantThreadPredicate(freeVarMasks, rewriter, loc, targetInfo);
+        emitRedundantThreadPredicate(freeVarMasks, rewriter, loc, targetInfo,
+                                     op);
 #endif // __TLE__
     uint32_t regMask = freeVarMasks.lookup(str_attr("reg"));
 
@@ -1044,7 +1060,8 @@ struct AtomicCASOpConversion
 
     auto freeVarMasks = getFreeVariableMasks(op.getPtr().getType());
     Value threadPred =
-        emitRedundantThreadPredicate(freeVarMasks, rewriter, loc, targetInfo);
+        emitRedundantThreadPredicate(freeVarMasks, rewriter, loc, targetInfo,
+                                     op);
     Value storePred = threadPred ? threadPred : b.true_val();
     uint32_t regMask = freeVarMasks.lookup(str_attr("reg"));
 
@@ -1184,7 +1201,8 @@ struct AtomicRMWOpConversion
 
     auto freeVarMasks = getFreeVariableMasks(op.getPtr().getType());
     Value threadPred =
-        emitRedundantThreadPredicate(freeVarMasks, rewriter, loc, targetInfo);
+        emitRedundantThreadPredicate(freeVarMasks, rewriter, loc, targetInfo,
+                                     op);
     Value storePred = threadPred ? threadPred : b.true_val();
     uint32_t regMask = freeVarMasks.lookup(str_attr("reg"));
 

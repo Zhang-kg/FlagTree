@@ -865,22 +865,12 @@ void populateMUSATlePatterns(TritonGPUTypeConverter &typeConverter,
 class ConvertTritonToTritonGPU
     : public triton::impl::ConvertTritonToTritonGPUBase<
           ConvertTritonToTritonGPU> {
-public:
-  using ConvertTritonToTritonGPUBase::ConvertTritonToTritonGPUBase;
-
-  void runOnOperation() override {
-    if (target.getValue().empty()) {
-      mlir::emitError(
-          getOperation().getLoc(),
-          "'convert-triton-to-tritongpu' requires 'target' option to be set");
-      return signalPassFailure();
-    }
-
+  LogicalResult convertOperations(ArrayRef<Operation *> operations,
+                                  int contextualNumWarps) {
     MLIRContext *context = &getContext();
-    ModuleOp mod = getOperation();
-    // type converter
-    TritonGPUTypeConverter typeConverter(context, numWarps, threadsPerWarp,
-                                         numCTAs, enableSourceRemat);
+    TritonGPUTypeConverter typeConverter(context, contextualNumWarps,
+                                         threadsPerWarp, numCTAs,
+                                         enableSourceRemat);
     TritonGPUConversionTarget target(*context, typeConverter);
     // rewrite patterns
     RewritePatternSet patterns(context);
@@ -896,14 +886,86 @@ public:
     populateMUSATlePatterns(typeConverter, patterns);
 #endif
     patterns.insert<GenericOpPattern<ub::PoisonOp>>(typeConverter, context);
+    return applyPartialConversion(operations, target, std::move(patterns));
+  }
 
+#ifdef __TLE__
+  LogicalResult convertWarpSpecializeWorkers(ModuleOp mod) {
+    SmallVector<WarpSpecializeOp> specializations;
+    mod.walk([&](WarpSpecializeOp ws) {
+      if (ws->hasAttr("musa_tle.static_warp_specialize"))
+        specializations.push_back(ws);
+    });
+    for (WarpSpecializeOp ws : specializations) {
+      auto partitions = ws.getPartitionOp();
+      auto regions = partitions.getPartitionRegions();
+      ArrayRef<int32_t> workerWarps = ws.getPartitionNumWarps();
+      if (regions.size() != workerWarps.size())
+        return ws.emitOpError("mthreads TLE worker region and warp-count sizes "
+                              "must match during layout conversion");
+
+      // Scalars, ordinary pointers, tensor descriptors and shared memdescs do
+      // not distribute register values across a role's warps. A distributed
+      // tensor capture does: changing its type here would silently require a
+      // cross-role register transfer. Leave that unsupported rather than
+      // emitting a convert_layout whose source belongs to another role.
+      for (Value capture : partitions.getExplicitCaptures()) {
+        Type type = capture.getType();
+        auto pointer = dyn_cast<triton::PointerType>(type);
+        if (isa<RankedTensorType>(type) ||
+            (pointer && isa<RankedTensorType>(pointer.getPointeeType())))
+          return ws.emitOpError(
+              "mthreads TLE static warp_specialize does not support "
+              "distributed tensor captures; construct the tensor inside each "
+              "role or communicate through a shared memdesc");
+      }
+
+      for (auto [index, region] : llvm::enumerate(regions)) {
+        if (workerWarps[index] <= 0 || !region.hasOneBlock())
+          return ws.emitOpError("mthreads TLE layout conversion requires "
+                                "single-block workers with positive warp counts");
+        SmallVector<Operation *> operations;
+        for (Operation &op : region.front())
+          operations.push_back(&op);
+        // The partitions are isolated from above and their block arguments
+        // have invariant types (checked above). Convert the whole worker at
+        // once so nested SCF loop-carried tensors and all of their users share
+        // the same contextual converter, including constants and ranges.
+        if (failed(convertOperations(operations, workerWarps[index])))
+          return failure();
+      }
+    }
+    return success();
+  }
+#endif
+
+public:
+  using ConvertTritonToTritonGPUBase::ConvertTritonToTritonGPUBase;
+
+  void runOnOperation() override {
+    if (target.getValue().empty()) {
+      mlir::emitError(
+          getOperation().getLoc(),
+          "'convert-triton-to-tritongpu' requires 'target' option to be set");
+      return signalPassFailure();
+    }
+
+    ModuleOp mod = getOperation();
     Builder b(&getContext());
     mod->setAttr(AttrNumWarpsName, b.getI32IntegerAttr(numWarps));
     mod->setAttr(AttrNumThreadsPerWarp, b.getI32IntegerAttr(threadsPerWarp));
     mod->setAttr(AttrNumCTAsName, b.getI32IntegerAttr(numCTAs));
     mod->setAttr(AttrTargetName, b.getStringAttr(this->target.getValue()));
 
-    if (failed(applyPartialConversion(mod, target, std::move(patterns))))
+#ifdef __TLE__
+    if (failed(convertWarpSpecializeWorkers(mod)))
+      return signalPassFailure();
+#endif
+    // Already-encoded worker types are intentionally preserved by the type
+    // converter. Only the prologue/default partition still needs the module's
+    // numWarps; applying that converter first would encode every worker using
+    // the default role's warp count.
+    if (failed(convertOperations({mod.getOperation()}, numWarps)))
       return signalPassFailure();
   }
 };
