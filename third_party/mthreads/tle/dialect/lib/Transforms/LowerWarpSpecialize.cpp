@@ -80,7 +80,7 @@ static LogicalResult validateExplicitCtaSyncs(ttg::WarpSpecializeOp ws) {
   for (auto [workerIndex, workerRegion] :
        llvm::enumerate(ws.getPartitionRegions())) {
     FailureOr<unsigned> workerCount =
-        countExplicitCtaSyncs(workerRegion, workerIndex);
+        countExplicitCtaSyncs(*workerRegion, workerIndex);
     if (failed(workerCount))
       return failure();
     if (*workerCount != *defaultCount)

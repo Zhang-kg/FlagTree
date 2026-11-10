@@ -67,7 +67,7 @@ def _persistent_hazard_writer(
             # the loop backedge and branch join expose it on later dataflow
             # visits.  A provisional pipe-only proof must therefore be able to
             # degrade to a full partition barrier before finalization.
-            if tile > 0:
+            if tile > 0 and hazard_kind != 2:
                 ptr = tle.gpu.local_ptr(slot.a, (0, 0))
                 if hazard_kind == 0:
                     tl.store(sink, tl.load(ptr))
@@ -85,6 +85,13 @@ def _persistent_hazard_writer(
                 (block_k, block_n),
                 (k_iter * block_k, 0),
             )
+            # A TME global-to-local payload is write-only, so RAW cannot
+            # disqualify the barrier immediately before that payload.  Cover
+            # the corresponding late CFG/backedge RAW edge at its only valid
+            # position: a read following the asynchronous payload write.
+            if tile > 0 and hazard_kind == 2:
+                ptr = tle.gpu.local_ptr(slot.a, (0, 0))
+                tl.store(sink, tl.load(ptr))
             writer.commit(token)
 
 
@@ -435,7 +442,9 @@ def test_tme_only_pipe_does_not_get_local_store_wait_groups():
     assert "musa_tle.pipe_local_store_group" not in ttgir
 
 
-@pytest.mark.parametrize("hazard_kind", [0, 1], ids=["war", "non_pipe_waw"])
+@pytest.mark.parametrize(
+    "hazard_kind", [0, 1, 2], ids=["war", "non_pipe_waw", "raw"]
+)
 def test_pipe_reuse_join_hazard_keeps_full_partition_barrier(hazard_kind):
     compiled = compile_musa(
         _persistent_hazard_kernel,
