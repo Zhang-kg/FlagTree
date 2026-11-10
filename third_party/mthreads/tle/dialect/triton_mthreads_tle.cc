@@ -510,6 +510,23 @@ void init_triton_musa_tle_ir(py::module m) {
     throw std::runtime_error("triton IR builder class is not initialized");
 
   auto &builderCls = *builderClsPtr;
+  // Native capability markers keep newer Python frontends fail-closed when
+  // paired with an older MThreads libtriton.
+  builderCls.attr("mthreads_tle_pipe_sqmma_version") = py::int_(2);
+  builderCls.attr("mthreads_tle_multifield_pipe_version") = py::int_(2);
+  builderCls.attr("mthreads_tle_one_shot_pipe_version") = py::int_(1);
+  builderCls.attr("mthreads_tle_dynamic_loops_version") = py::int_(1);
+  builderCls.attr("mthreads_tle_split_m_sqmma_version") = py::int_(1);
+  builderCls.attr("mthreads_tle_split128_sqmma_version") = py::int_(1);
+  builderCls.attr("mthreads_tle_local_barrier_version") = py::int_(1);
+  builderCls.attr("mthreads_tle_persistent_ordered_sqmma_version") =
+      py::int_(1);
+  builderCls.attr("mthreads_tle_dynamic_partition_sync_version") =
+      py::int_(1);
+  builderCls.attr("mthreads_tle_grouped_completion_version") = py::int_(1);
+  builderCls.attr("mthreads_tle_16_warp_persistent_version") = py::int_(1);
+  builderCls.attr("mthreads_tle_fused_pipe_consumer_version") = py::int_(1);
+  builderCls.attr("mthreads_tle_default_producer_version") = py::int_(1);
   builderCls
       .def("ensure_ttg_layout_attrs",
            [](TritonOpBuilder &self, int numWarps, int threadsPerWarp,
@@ -884,6 +901,31 @@ void init_triton_musa_tle_ir(py::module m) {
                  resultType, src,
                  self.getBuilder().getI64IntegerAttr(offsetBytes));
            })
+      .def("create_memdesc_subslice",
+           [](TritonOpBuilder &self, mlir::Type resultType, mlir::Value src,
+              std::vector<int32_t> offsets) -> mlir::Value {
+             auto srcType = mlir::dyn_cast<ttg::MemDescType>(src.getType());
+             auto resultTypeMemDesc =
+                 mlir::dyn_cast<ttg::MemDescType>(resultType);
+             if (!srcType || !resultTypeMemDesc)
+               throw py::value_error(
+                   "mthreads TLE memdesc subslice requires memdesc types");
+             if (offsets.size() != srcType.getRank() ||
+                 resultTypeMemDesc.getRank() != srcType.getRank())
+               throw py::value_error(
+                   "mthreads TLE memdesc subslice requires rank-matched "
+                   "offsets");
+             for (auto [dim, offset] : llvm::enumerate(offsets)) {
+               int64_t length = resultTypeMemDesc.getShape()[dim];
+               if (offset < 0 || length <= 0 ||
+                   static_cast<int64_t>(offset) + length >
+                       srcType.getShape()[dim])
+                 throw py::value_error(
+                     "mthreads TLE memdesc subslice is out of bounds");
+             }
+             return self.create<ttg::MemDescSubsliceOp>(resultType, src,
+                                                        offsets);
+           })
       .def("create_memdesc_trans",
            [](TritonOpBuilder &self, mlir::Value src,
               std::vector<int> order) -> mlir::Value {
@@ -955,14 +997,19 @@ void init_triton_musa_tle_ir(py::module m) {
            })
       .def("create_warp_specialize",
            [](TritonOpBuilder &self, std::vector<mlir::Type> resultTypes,
-              std::vector<int32_t> partitionNumWarps) -> TLEWarpSpecializeOp {
+              std::vector<int32_t> partitionNumWarps,
+              bool defaultIsProducer) -> TLEWarpSpecializeOp {
              auto &builder = self.getBuilder();
              auto op = self.create<ttg::WarpSpecializeOp>(resultTypes,
                                                           partitionNumWarps);
              op->setAttr("musa_tle.static_warp_specialize",
                          builder.getUnitAttr());
+             if (defaultIsProducer)
+               op->setAttr("musa_tle.default_producer", builder.getUnitAttr());
              return TLEWarpSpecializeOp(op);
-           })
+           },
+           py::arg("result_types"), py::arg("partition_num_warps"),
+           py::arg("default_is_producer") = false)
       .def("create_exclusive_cumsum",
            [](TritonOpBuilder &self, mlir::Type exclusiveTy, mlir::Type totalTy,
               mlir::Value src, int axis, bool reverse) -> mlir::OpState {

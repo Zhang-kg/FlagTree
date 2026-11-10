@@ -36,6 +36,14 @@ inline constexpr llvm::StringLiteral kTMEExplicitCompletionAttr =
     "musa.tme.explicit_completion";
 inline constexpr llvm::StringLiteral kTLEExpectBytesAttr =
     "musa_tle.expect_bytes";
+inline constexpr llvm::StringLiteral kTLEExpectBytesPartsAttr =
+    "musa_tle.expect_bytes_parts";
+inline constexpr llvm::StringLiteral kTLEGroupedCompletionAttr =
+    "musa_tle.grouped_completion";
+inline constexpr llvm::StringLiteral kTLEGroupedPerCopyCompletionAttr =
+    "musa_tle.grouped_per_copy_completion";
+inline constexpr llvm::StringLiteral kTLEGroupedCompletionFinalAttr =
+    "musa_tle.grouped_completion_final";
 inline constexpr llvm::StringLiteral kTLECompletionGroupAttr =
     "musa_tle.completion_group";
 inline constexpr llvm::StringLiteral kTLEPipeDeferredArrivalAttr =
@@ -623,7 +631,15 @@ resolveCanonicalPH1TMESharedCarrierConfig(ttg::MemDescType localType) {
 
   constexpr int64_t kLineBytes = 256;
   int64_t elemBytes = *maybeElemBytes;
-  int64_t leadingWidthBytes = localType.getShape()[order.front()] * elemBytes;
+  ArrayRef<int64_t> physicalShape = localType.getAllocShape();
+  if (physicalShape.empty())
+    physicalShape = localType.getShape();
+  else {
+    if (physicalShape.size() < localType.getShape().size())
+      return failure();
+    physicalShape = physicalShape.take_back(localType.getShape().size());
+  }
+  int64_t leadingWidthBytes = physicalShape[order.front()] * elemBytes;
   if (leadingWidthBytes <= 0)
     return failure();
 
@@ -768,7 +784,8 @@ inline FailureOr<ResolvedTMESwizzleConfig>
 resolveTMESwizzleConfigFromMatrixView(ttg::MemDescType localType,
                                       ArrayRef<int64_t> matrixPhysicalShape,
                                       ArrayRef<unsigned> matrixOrder) {
-  if (localType.getShape().size() == 2)
+  if (localType.getShape().size() == 2 &&
+      localType.getShape() == matrixPhysicalShape)
     return resolveTMESwizzleConfigFromEncoding(localType);
 
   auto swizzled =

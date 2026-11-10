@@ -37,20 +37,6 @@ class _FakeActive:
         return self._interface
 
 
-class _FakePPUActive(_FakeActive):
-    """Model the active driver class exposed by FlagTree's PPU backend."""
-
-
-_FakePPUActive.__module__ = "triton.backends.ppu.driver"
-
-
-class _FakeHCUActive(_FakeActive):
-    """Model the active driver class exposed by FlagTree's Hygon backend."""
-
-
-_FakeHCUActive.__module__ = "triton.backends.hcu.driver"
-
-
 def test_probe_cuda_uses_native_architecture_and_explicit_device(monkeypatch):
     from triton.flagtune.runtime import device
 
@@ -85,47 +71,17 @@ def test_probe_hip_preserves_gfx_architecture(monkeypatch):
     assert descriptor.architecture == "gfx942"
 
 
-def test_probe_maca_uses_metax_runtime_contract(monkeypatch):
+@pytest.mark.parametrize(
+    ("raw_arch", "expected_arch"),
+    [(31, "ph1"), ("ph1", "ph1"), (22, "mp22")],
+)
+def test_probe_musa_uses_mthreads_identity(monkeypatch, raw_arch, expected_arch):
     from triton.flagtune.runtime import device
 
     monkeypatch.setattr(
         device,
         "_active_driver",
-        lambda: _FakeActive("maca", 80, ("MetaX C550", )),
-    )
-    descriptor = probe_flagtune_device()
-
-    assert descriptor.backend == "maca"
-    assert descriptor.vendor == "metax"
-    assert descriptor.torch_device_type == "cuda"
-    assert descriptor.device_name == "MetaX C550"
-    assert descriptor.architecture == "sm80"
-
-
-def test_probe_cuda_target_from_ppu_driver_uses_thead_runtime_contract(monkeypatch):
-    from triton.flagtune.runtime import device
-
-    monkeypatch.setattr(
-        device,
-        "_active_driver",
-        lambda: _FakePPUActive("cuda", 80, ("PPU-ZW810E", )),
-    )
-    descriptor = probe_flagtune_device()
-
-    assert descriptor.backend == "cuda"
-    assert descriptor.vendor == "thead"
-    assert descriptor.torch_device_type == "cuda"
-    assert descriptor.device_name == "PPU-ZW810E"
-    assert descriptor.architecture == "sm80"
-
-
-def test_probe_musa_uses_mthreads_runtime_contract(monkeypatch):
-    from triton.flagtune.runtime import device
-
-    monkeypatch.setattr(
-        device,
-        "_active_driver",
-        lambda: _FakeActive("musa", 31, ("MTT S5000", )),
+        lambda: _FakeActive("musa", raw_arch, ("MTT S5000", )),
     )
     descriptor = probe_flagtune_device()
 
@@ -133,24 +89,7 @@ def test_probe_musa_uses_mthreads_runtime_contract(monkeypatch):
     assert descriptor.vendor == "mthreads"
     assert descriptor.torch_device_type == "musa"
     assert descriptor.device_name == "MTT S5000"
-    assert descriptor.architecture == "musa31"
-
-
-def test_probe_hip_target_from_hcu_driver_uses_hygon_runtime_contract(monkeypatch):
-    from triton.flagtune.runtime import device
-
-    monkeypatch.setattr(
-        device,
-        "_active_driver",
-        lambda: _FakeHCUActive("hip", "gfx936", ("BW", )),
-    )
-    descriptor = probe_flagtune_device()
-
-    assert descriptor.backend == "hip"
-    assert descriptor.vendor == "hygon"
-    assert descriptor.torch_device_type == "cuda"
-    assert descriptor.device_name == "BW"
-    assert descriptor.architecture == "gfx936"
+    assert descriptor.architecture == expected_arch
 
 
 def test_probe_unknown_backend_fails_at_device_boundary(monkeypatch):
@@ -159,7 +98,7 @@ def test_probe_unknown_backend_fails_at_device_boundary(monkeypatch):
     monkeypatch.setattr(device, "_active_driver", lambda: _FakeActive("xpu", "pvc"))
     with pytest.raises(
             UnsupportedFlagTuneDeviceError,
-            match="does not support Triton backend 'xpu'.*cuda, hip, maca, musa",
+            match="does not support Triton backend 'xpu'.*cuda, hip, musa",
     ):
         probe_flagtune_device()
 

@@ -1,6 +1,4 @@
-#include "TritonMUSACommon/ConvertLayoutUtils.h"
 #include "TritonMUSACommon/MMAOperandUtils.h"
-#include "TritonMUSACommon/MusaArchTraits.h"
 #include "TritonMUSACommon/TMEUtils.h"
 #include "TritonMUSAGPUToLLVM/Allocation.h"
 #include "TritonMUSAGPUToLLVM/Passes.h"
@@ -26,6 +24,91 @@ namespace mlir::triton {
 } // namespace mlir::triton
 
 namespace {
+
+static bool isMusaSqmmaLike(Attribute layout) {
+  while (auto slice = dyn_cast<SliceEncodingAttr>(layout))
+    layout = slice.getParent();
+  return isa<MUSASqmmaEncodingAttr>(layout);
+}
+
+static bool useMusaReplicatedScratch(Attribute srcLayout, Attribute dstLayout) {
+  return (isMusaSqmmaLike(srcLayout) || isMusaSqmmaLike(dstLayout)) &&
+         isa<MmaEncodingTrait, BlockedEncodingAttr, SliceEncodingAttr>(
+             srcLayout) &&
+         isa<MmaEncodingTrait, BlockedEncodingAttr, SliceEncodingAttr>(
+             dstLayout);
+}
+
+static bool isSqmmaAccumulatorToBlockedLike(Attribute srcLayout,
+                                            Attribute dstLayout) {
+  return isMusaSqmmaLike(srcLayout) &&
+         isa<BlockedEncodingAttr, SliceEncodingAttr>(dstLayout);
+}
+
+static bool useMusaSqmmaBlockSwizzling(RankedTensorType srcTy,
+                                       RankedTensorType dstTy) {
+  if (!(isMusaSqmmaLike(srcTy.getEncoding()) ||
+        isMusaSqmmaLike(dstTy.getEncoding())))
+    return false;
+
+  LinearLayout conversion = minimalCvtLayout(srcTy, dstTy);
+  MLIRContext *ctx = srcTy.getContext();
+  StringAttr kBlock = str_attr("block");
+  StringAttr kWarp = str_attr("warp");
+  StringAttr kLane = str_attr("lane");
+  auto dims = conversion.getInDimNames();
+
+  if (llvm::is_contained(dims, kBlock))
+    return false;
+  if (llvm::is_contained(dims, kWarp))
+    return true;
+  if (llvm::is_contained(dims, kLane))
+    return !cvtNeedsWarpShuffle(srcTy, dstTy);
+  return false;
+}
+
+static bool isPlainBlockedLike(Attribute layout) {
+  return isa<BlockedEncodingAttr, SliceEncodingAttr>(layout);
+}
+
+static bool useConservativeCarrierScratch(RankedTensorType srcTy,
+                                          RankedTensorType dstTy) {
+  auto srcElemTy = srcTy.getElementType();
+  auto dstElemTy = dstTy.getElementType();
+
+  auto needsByteCarrier = [](Type ty) {
+    return ty.isIntOrFloat() && ty.getIntOrFloatBitWidth() < 8;
+  };
+  bool isPointerCarrier = isa<triton::PointerType>(srcElemTy) &&
+                          isa<triton::PointerType>(dstElemTy);
+  bool isSubByteCarrier =
+      needsByteCarrier(srcElemTy) && needsByteCarrier(dstElemTy);
+  if (!isPointerCarrier && !isSubByteCarrier)
+    return false;
+
+  if (!isa<BlockedEncodingAttr, SliceEncodingAttr>(srcTy.getEncoding()) ||
+      !isa<BlockedEncodingAttr, SliceEncodingAttr>(dstTy.getEncoding()))
+    return false;
+
+  LinearLayout conversion = minimalCvtLayout(srcTy, dstTy);
+  MLIRContext *ctx = srcTy.getContext();
+  StringAttr kBlock = str_attr("block");
+  return !llvm::is_contained(conversion.getInDimNames(), kBlock);
+}
+
+static bool useMusaGenericBlockSwizzling(RankedTensorType srcTy,
+                                         RankedTensorType dstTy) {
+  if (isMusaSqmmaLike(srcTy.getEncoding()) ||
+      isMusaSqmmaLike(dstTy.getEncoding()))
+    return false;
+  if (!cvtNeedsSharedMemory(srcTy, dstTy))
+    return false;
+
+  LinearLayout conversion = minimalCvtLayout(srcTy, dstTy);
+  MLIRContext *ctx = srcTy.getContext();
+  StringAttr kBlock = str_attr("block");
+  return !llvm::is_contained(conversion.getInDimNames(), kBlock);
+}
 
 static LinearLayout
 getMusaSwizzledScratchLayout(RankedTensorType srcTy, RankedTensorType dstTy,
@@ -81,12 +164,12 @@ static bool
 needsMusaRepDisjointGenericScratchImpl(RankedTensorType srcTy,
                                        RankedTensorType dstTy,
                                        const TargetInfoBase &targetInfo) {
-  if (!(musa::isPlainBlockedLike(srcTy.getEncoding()) &&
-        musa::isPlainBlockedLike(dstTy.getEncoding())))
+  if (!(isPlainBlockedLike(srcTy.getEncoding()) &&
+        isPlainBlockedLike(dstTy.getEncoding())))
     return false;
   if (getBitwidth(srcTy) != 64)
     return false;
-  if (!musa::useMusaGenericBlockSwizzling(srcTy, dstTy))
+  if (!useMusaGenericBlockSwizzling(srcTy, dstTy))
     return false;
   return hasPH1PhysicalSliceRep(
       getMusaSwizzledScratchLayout(srcTy, dstTy, targetInfo));
@@ -97,7 +180,7 @@ static unsigned getFullLogicalScratchBytes(RankedTensorType ty) {
   return elems * getBitwidth(ty) / 8;
 }
 
-static FailureOr<int64_t> getTMESwizzledSharedLineBytes(MemDescType memDescTy) {
+static FailureOr<int64_t> getPH1SwizzledSharedLineBytes(MemDescType memDescTy) {
   unsigned rank = memDescTy.getRank();
   if (rank != 2 && rank != 3)
     return failure();
@@ -141,22 +224,10 @@ static FailureOr<int64_t> getTMESwizzledSharedLineBytes(MemDescType memDescTy) {
   if (failed(swizzle) || swizzle->swizzleGranularity ==
                              triton::musa::TMESwizzleGranularity::SG_NONE)
     return failure();
-  // Align to the full swizzle window, not just the line: the address bits the
-  // swizzle XOR reads span [log2(line), log2(line) + log2(stride/granularity)),
-  // so only window alignment makes the buffer-relative swizzle equal to the
-  // absolute swizzle the hardware applies. The LinearLayout-based software
-  // lowering (LoadStoreOpToLLVM.cpp) depends on this equivalence.
-  int64_t lineBytes = triton::musa::getSwizzleLineBytes(swizzle->swizzleLine);
-  int64_t strideBytes =
-      triton::musa::getSwizzleStrideBytes(swizzle->swizzleStride);
-  int64_t granBytes =
-      triton::musa::getSwizzleGranularityBytes(swizzle->swizzleGranularity);
-  if (granBytes <= 0 || strideBytes < granBytes)
-    return lineBytes;
-  return lineBytes * (strideBytes / granBytes);
+  return triton::musa::getSwizzleLineBytes(swizzle->swizzleLine);
 }
 
-static void normalizeTMESwizzledSharedLocalAllocAlignment(ModuleOp mod) {
+static void normalizePH1SwizzledSharedLocalAllocAlignment(ModuleOp mod) {
   Builder builder(mod.getContext());
   mod.walk([&](LocalAllocOp alloc) {
     if (!alloc.isSharedMemoryAlloc())
@@ -165,7 +236,7 @@ static void normalizeTMESwizzledSharedLocalAllocAlignment(ModuleOp mod) {
     if (!memDescTy)
       return;
 
-    auto lineBytes = getTMESwizzledSharedLineBytes(memDescTy);
+    auto lineBytes = getPH1SwizzledSharedLineBytes(memDescTy);
     if (failed(lineBytes) || *lineBytes <= alloc.getAlignmentOrDefault())
       return;
 
@@ -215,8 +286,8 @@ static unsigned getMusaScratchSizeInBytes(Operation *op,
 
   Attribute srcLayout = srcTy.getEncoding();
   Attribute dstLayout = dstTy.getEncoding();
-  if (musa::useMusaReplicatedScratch(srcLayout, dstLayout)) {
-    if (!musa::isMusaSqmmaAccumulatorToBlockedLike(srcLayout, dstLayout))
+  if (useMusaReplicatedScratch(srcLayout, dstLayout)) {
+    if (!isSqmmaAccumulatorToBlockedLike(srcLayout, dstLayout))
       return getFullLogicalScratchBytes(srcTy);
 
     bool separateRepScratch =
@@ -227,11 +298,11 @@ static unsigned getMusaScratchSizeInBytes(Operation *op,
     return elems * getBitwidth(srcTy) / 8;
   }
 
-  if (musa::useConservativeCarrierScratch(srcTy, dstTy))
+  if (useConservativeCarrierScratch(srcTy, dstTy))
     return getFullLogicalScratchBytes(srcTy);
 
-  if (musa::useMusaSqmmaBlockSwizzling(srcTy, dstTy) ||
-      musa::useMusaGenericBlockSwizzling(srcTy, dstTy)) {
+  if (useMusaSqmmaBlockSwizzling(srcTy, dstTy) ||
+      useMusaGenericBlockSwizzling(srcTy, dstTy)) {
     bool separateRepScratch =
         mlir::triton::musa_gpu::needsMusaRepDisjointGenericScratch(srcTy, dstTy,
                                                                    targetInfo);
@@ -257,8 +328,8 @@ struct AllocateMUSASharedMemory
   void runOnOperation() override {
     ModuleOp mod = getOperation();
     MUSA::TargetInfo targetInfo(computeCapability);
-    if (musa::supportsMusaTME(computeCapability))
-      normalizeTMESwizzledSharedLocalAllocAlignment(mod);
+    if (computeCapability == 31)
+      normalizePH1SwizzledSharedLocalAllocAlignment(mod);
     ModuleAllocation allocation(
         mod, mlir::triton::musa_gpu::getMusaAllocationAnalysisScratchSizeFn(
                  targetInfo));

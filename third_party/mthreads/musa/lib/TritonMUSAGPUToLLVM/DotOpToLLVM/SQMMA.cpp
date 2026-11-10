@@ -3,7 +3,6 @@
 #include "DotOpToLLVM.h"
 #include "TritonMUSACommon/MMAContractUtils.h"
 #include "TritonMUSACommon/MMAOperandUtils.h"
-#include "TritonMUSACommon/MusaArchTraits.h"
 #include "TritonMUSACommon/TMEUtils.h"
 #include "TritonMUSAGPUToLLVM/Utility.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -577,12 +576,8 @@ LogicalResult convertSQMMADotImpl(DotLikeOp op, DotLikeAdaptor adaptor,
   auto mmaEnc = dyn_cast<MUSASqmmaEncodingAttr>(dTy.getEncoding());
   if (!mmaEnc)
     return op.emitError("MUSA SQMMA: expected #ttg.musa_sqmma result encoding");
-  auto sqArch = triton::musa::getMusaArchFromSqmmaVersion(
-      mmaEnc.getVersionMajor(), mmaEnc.getVersionMinor());
-  const triton::musa::MusaSqmmaArchTraits *sqTraits =
-      sqArch ? triton::musa::getMusaSqmmaArchTraits(*sqArch) : nullptr;
-  if (!sqTraits)
-    return op.emitError("MUSA SQMMA: unsupported encoding version");
+  if (!mmaEnc.isPH1())
+    return op.emitError("MUSA SQMMA: unsupported version");
 
   unsigned rank = dTy.getRank();
   if (rank != 2 && rank != 3)
@@ -594,7 +589,8 @@ LogicalResult convertSQMMADotImpl(DotLikeOp op, DotLikeAdaptor adaptor,
 
   const unsigned instM = instrShape[0];
   const unsigned instN = instrShape[1];
-  const unsigned instK = instrShape[2];
+  const unsigned encodedInstK = instrShape[2];
+  unsigned instK = encodedInstK;
 
   Value opA = getDotOperandA(op);
   Value opB = getDotOperandB(op);
@@ -606,20 +602,17 @@ LogicalResult convertSQMMADotImpl(DotLikeOp op, DotLikeAdaptor adaptor,
   Value adaptorA = getDotAdaptorA(adaptor);
   Value adaptorB = getDotAdaptorB(adaptor);
   Value adaptorC = getDotAdaptorC(adaptor);
-
   auto aOperand = triton::musa::resolveSharedOperandWithAffineBase(
       opA, adaptorA, loc, typeConverter, rewriter);
+  auto bOperand = triton::musa::resolveSharedOperandWithAffineBase(
+      opB, adaptorB, loc, typeConverter, rewriter);
   if (failed(aOperand))
     return op.emitError(
         "MUSA SQMMA requires operand A from ttg.local_load(shared memdesc)");
-
-  auto bOperand = triton::musa::resolveSharedOperandWithAffineBase(
-      opB, adaptorB, loc, typeConverter, rewriter);
   if (failed(bOperand))
     return op.emitError(
         "MUSA SQMMA requires operand B from ttg.local_load(shared memdesc)");
 
-  auto aTy = cast<TensorOrMemDesc>(opA.getType());
   auto aMemTy = aOperand->memDescTy;
   auto bMemTy = bOperand->memDescTy;
 
@@ -633,17 +626,28 @@ LogicalResult convertSQMMADotImpl(DotLikeOp op, DotLikeAdaptor adaptor,
   auto eltTypeC = getDotEltTypeC(op);
   auto eltTypeA = getDotEltTypeA(op);
   auto eltTypeB = getDotEltTypeB(op);
-  auto layoutA = getDotLayoutA(op);
-  auto layoutB = getDotLayoutB(op);
-  int elemBitWidth = aTy.getElementType().getIntOrFloatBitWidth();
-  if (elemBitWidth <= 0)
-    return op.emitError("MUSA SQMMA: unsupported operand element width");
-  unsigned elemBytes = static_cast<unsigned>((elemBitWidth + 7) / 8);
-  if (elemBytes == 0)
-    elemBytes = 1;
+  const int capability =
+      triton::musa::getMusaComputeCapability(op.getOperation());
 
-  if (!isSupportedSqmma(eltTypeA, eltTypeB, eltTypeC, instM, instN, instK,
-                        *sqTraits, layoutA, layoutB, elemBytes, true, true))
+  // PH1 advertises a narrow FP16/BF16 K=128 contract, but the bundled llc
+  // shipped with the current MUSA toolchain crashes while expanding the
+  // corresponding LLVM intrinsic. Keep the logical K=128 encoding (so the
+  // layout/descriptor contract remains unchanged) and lower only this
+  // compatibility subset to two K=64 operations, which use the stable SQMMA
+  // intrinsic family. The loader's K-tile controls the descriptor offset, so
+  // the two calls consume adjacent K=64 slices of the same shared tile.
+  // Native K=128 forms (for example s8/fp8) must retain their original
+  // intrinsic and descriptor contract.
+  const bool splitNarrowK128 =
+      capability == 31 && encodedInstK == 128 && eltTypeA == eltTypeB &&
+      (eltTypeA == triton::musa::SQMMAEltType::f16 ||
+       eltTypeA == triton::musa::SQMMAEltType::bf16);
+  if (splitNarrowK128)
+    instK = 64;
+
+  if (!triton::musa::isSupportedSqmmaForCapability(
+          eltTypeA, eltTypeB, eltTypeC, instM, instN, encodedInstK,
+          capability))
     return op.emitError("MUSA SQMMA: unsupported shape or element type");
   std::string sqmmaIntrinsic =
       triton::musa::lookupSqmmaIntrinsic(eltTypeA, instM, instN, instK);
@@ -668,7 +672,7 @@ LogicalResult convertSQMMADotImpl(DotLikeOp op, DotLikeAdaptor adaptor,
   auto ceilDiv = [](unsigned x, unsigned y) { return (x + y - 1) / y; };
   unsigned numRepM = ceilDiv(blockM, tileM);
   unsigned numRepN = ceilDiv(blockN, tileN);
-  int64_t kDimVal = aTy.getShape().back();
+  int64_t kDimVal = aMemTy.getShape().back();
   if (kDimVal <= 0)
     return op.emitError("MUSA SQMMA requires static positive K dimension");
   unsigned kDim = static_cast<unsigned>(kDimVal);
@@ -720,6 +724,8 @@ LogicalResult convertSQMMADotImpl(DotLikeOp op, DotLikeAdaptor adaptor,
   Value squadMN = b.udiv(squad, b.i32_val(squadsM));
   Value squadN = b.urem(squadMN, b.i32_val(squadsN));
 
+  auto layoutA = getDotLayoutA(op);
+  auto layoutB = getDotLayoutB(op);
   bool loaderTransA = layoutA == triton::musa::SQMMALayout::col;
   bool loaderTransB = layoutB == triton::musa::SQMMALayout::row;
   int32_t intrinsicTransA = (layoutA == triton::musa::SQMMALayout::col) ? 1 : 0;
@@ -753,10 +759,6 @@ LogicalResult convertSQMMADotImpl(DotLikeOp op, DotLikeAdaptor adaptor,
   SqmmaSmemLoader bLoader(bOperand->memDesc, bOperand->affineBase, *bMatrixView,
                           squadN, squadsN, loaderTransB, instN, instK,
                           *bDescSpec, rewriter, loc);
-  auto loadAOperandForTile = [&](const SqmmaTileState &tile,
-                                 unsigned kRep) -> FailureOr<Value> {
-    return aLoader.smemDesc(tile.batch, tile.mRep, kRep, rewriter, loc);
-  };
 
   auto accumulationMode = getDotAccumulationMode(op);
   uint32_t maxNumImpreciseAcc = getDotMaxNumImpreciseAcc(op);
@@ -814,14 +816,13 @@ LogicalResult convertSQMMADotImpl(DotLikeOp op, DotLikeAdaptor adaptor,
         accumElems = unpackLLVector(loc, accSliceVec, rewriter);
       }
       for (unsigned kRep = 0; kRep < numRepK; ++kRep) {
-        auto opA = loadAOperandForTile(tile, kRep);
-        if (failed(opA))
-          return op.emitError("MUSA SQMMA failed to materialize operand A");
+        Value opA =
+            aLoader.smemDesc(tile.batch, tile.mRep, kRep, rewriter, loc);
         Value opB =
             bLoader.smemDesc(tile.batch, tile.nRep, kRep, rewriter, loc);
 
         SmallVector<Value> args = {
-            *opA,
+            opA,
             opB,
             LLVM::ZeroOp::create(rewriter, loc, ivecTy),
             b.i32_val(intrinsicTransA),
@@ -900,9 +901,7 @@ LogicalResult convertSQMMADotImpl(DotLikeOp op, DotLikeAdaptor adaptor,
     uint32_t numLowPrecAcc = 0;
     Value partialAcc;
     for (unsigned kRep = 0; kRep < numRepK; ++kRep) {
-      auto opA = loadAOperandForTile(tile, kRep);
-      if (failed(opA))
-        return op.emitError("MUSA SQMMA failed to materialize operand A");
+      Value opA = aLoader.smemDesc(tile.batch, tile.mRep, kRep, rewriter, loc);
       Value opB = bLoader.smemDesc(tile.batch, tile.nRep, kRep, rewriter, loc);
       numLowPrecAcc += instK;
       bool requireAdd =
@@ -913,7 +912,7 @@ LogicalResult convertSQMMADotImpl(DotLikeOp op, DotLikeAdaptor adaptor,
           mmaAcc ? mmaAcc : LLVM::ZeroOp::create(rewriter, loc, ivecTy);
 
       SmallVector<Value> args = {
-          *opA,
+          opA,
           opB,
           inputAcc,
           b.i32_val(intrinsicTransA),

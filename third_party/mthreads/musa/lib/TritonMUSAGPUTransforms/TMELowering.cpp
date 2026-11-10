@@ -98,19 +98,9 @@ static LogicalResult lowerDescriptorLoad(tt::DescriptorLoadOp op,
   Value localLoadValue;
   auto getLocalLoadValue = [&]() -> Value {
     if (!localLoadValue) {
-#ifdef __TLE__
-      auto localLoad =
-          ttg::LocalLoadOp::create(rewriter, loc, op.getType(), alloc);
-      if (Attribute explicitEncoding =
-              getTleExplicitValueEncoding(op.getResult()))
-        setTleExplicitResultEncoding(localLoad.getOperation(), 0,
-                                     explicitEncoding);
-      localLoadValue = localLoad.getResult();
-#else
       localLoadValue =
           ttg::LocalLoadOp::create(rewriter, loc, op.getType(), alloc)
               .getResult();
-#endif // __TLE__
     }
     return localLoadValue;
   };
@@ -214,21 +204,31 @@ static LogicalResult lowerTMACopy(ttg::TMACopyOp op, RewriterBase &rewriter) {
     // do not allocate a hidden per-copy barrier here.
     if (Value completionBarrier = op.getCompletionBarrier()) {
       auto expectBytes = op->getAttrOfType<IntegerAttr>("expect_bytes");
-      if (!expectBytes || expectBytes.getInt() <= 0)
+      bool groupedCompletion =
+          op->hasAttr(triton::musa::kTLEGroupedCompletionAttr);
+      if ((!expectBytes || expectBytes.getInt() <= 0) && !groupedCompletion)
         return op.emitOpError(
-            "completion barrier requires positive expect_bytes");
+            "completion barrier requires positive expect_bytes or a grouped "
+            "completion marker");
       auto asyncCopy = triton::musa::createAsyncTMECopyGlobalToLocal(
           rewriter, loc, op.getSrc(), *coord, completionBarrier, op.getDst(),
           pred, *config);
-      asyncCopy->setAttr("musa_tle.expect_bytes",
-                         rewriter.getI32IntegerAttr(expectBytes.getInt()));
-      if (Attribute completionGroup =
-              op->getAttr(triton::musa::kTLECompletionGroupAttr))
-        asyncCopy->setAttr(triton::musa::kTLECompletionGroupAttr,
-                           completionGroup);
-      if (op->hasAttr(triton::musa::kTLEPipeDeferredArrivalAttr))
-        asyncCopy->setAttr(triton::musa::kTLEPipeDeferredArrivalAttr,
+      if (expectBytes)
+        asyncCopy->setAttr(triton::musa::kTLEExpectBytesAttr,
+                           rewriter.getI32IntegerAttr(expectBytes.getInt()));
+      if (groupedCompletion)
+        asyncCopy->setAttr(triton::musa::kTLEGroupedCompletionAttr,
                            rewriter.getUnitAttr());
+      // Pipe lowering annotates the final payload of a multi-field commit so
+      // LowerTMETransactions can place the single producer arrival after all
+      // fields.  Preserve this protocol marker while converting ttg.tma_copy
+      // to the async TME operation.
+      if (op->hasAttr(triton::musa::kTLEGroupedCompletionFinalAttr))
+        asyncCopy->setAttr(triton::musa::kTLEGroupedCompletionFinalAttr,
+                           rewriter.getUnitAttr());
+      if (auto parts = op->getAttrOfType<DenseI32ArrayAttr>(
+              triton::musa::kTLEExpectBytesPartsAttr))
+        asyncCopy->setAttr(triton::musa::kTLEExpectBytesPartsAttr, parts);
       rewriter.eraseOp(op);
       return success();
     }
@@ -263,16 +263,8 @@ static LogicalResult lowerTMACopy(ttg::TMACopyOp op, RewriterBase &rewriter) {
     if (failed(config))
       return op.emitOpError("unable to resolve final TME store config");
 
-    auto asyncCopy = triton::musa::createAsyncTMECopyLocalToGlobal(
+    triton::musa::createAsyncTMECopyLocalToGlobal(
         rewriter, loc, op.getDst(), *coord, op.getSrc(), pred, *config);
-#ifdef __TLE__
-    if (Attribute readerTMEStore =
-            op->getAttr(triton::musa::kTLEPipeReaderTMEStoreAttr))
-      asyncCopy->setAttr(triton::musa::kTLEPipeReaderTMEStoreAttr,
-                         readerTMEStore);
-    if (Attribute issueThread = op->getAttr(triton::musa::kTMEIssueThreadAttr))
-      asyncCopy->setAttr(triton::musa::kTMEIssueThreadAttr, issueThread);
-#endif // __TLE__
     triton::musa::TMEStoreCommitOp::create(rewriter, loc);
     triton::musa::TMEStoreReadWaitOp::create(rewriter, loc);
   }
@@ -281,25 +273,6 @@ static LogicalResult lowerTMACopy(ttg::TMACopyOp op, RewriterBase &rewriter) {
   return success();
 }
 #endif // __TLE__
-
-static LogicalResult lowerMakeTensorDesc(tt::MakeTensorDescOp op,
-                                         RewriterBase &rewriter) {
-  auto loc = op.getLoc();
-  rewriter.setInsertionPoint(op);
-
-  auto alloc = ttg::GlobalScratchAllocOp::create(
-      rewriter, loc, triton::getPointerType(rewriter.getI8Type()),
-      triton::musa::kTMEDescSizeBytes, triton::musa::kTMEDescAlignBytes);
-
-  if (failed(triton::musa::createTMEEncodedDescriptor(rewriter,
-                                                      alloc.getResult(), op)))
-    return failure();
-
-  auto newDesc = triton::musa::ReinterpretTensorDescOp::create(
-      rewriter, loc, op.getType(), alloc.getResult());
-  rewriter.replaceOp(op, newDesc);
-  return success();
-}
 
 } // namespace
 
@@ -328,17 +301,6 @@ struct TritonMUSAGPUTMELoweringPass
         }
       }
 #endif // __TLE__
-
-      SmallVector<tt::MakeTensorDescOp> makeDescOps;
-      func.walk([&](tt::MakeTensorDescOp op) { makeDescOps.push_back(op); });
-      for (tt::MakeTensorDescOp op : makeDescOps) {
-        if (!op->getBlock())
-          continue;
-        if (failed(lowerMakeTensorDesc(op, rewriter))) {
-          signalPassFailure();
-          return;
-        }
-      }
 
       SmallVector<tt::DescriptorLoadOp> loadOps;
       func.walk([&](tt::DescriptorLoadOp op) { loadOps.push_back(op); });

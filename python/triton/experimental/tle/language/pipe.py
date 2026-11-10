@@ -19,18 +19,11 @@
 # SOFTWARE.
 
 # flagtree tle
-from __future__ import annotations
-
-from typing import TYPE_CHECKING
-
 import triton.language.core as tl
 
 from .gpu import types as gpu_types
 from .gpu.mthreads import common as mthreads_common
 from .gpu.mthreads import pipe as mthreads_pipe
-
-if TYPE_CHECKING:
-    from . import TLESemantic
 
 
 def _unwrap_pipe_constexpr(value):
@@ -85,27 +78,17 @@ def pipe(
     name=None,
     readers=None,
     one_shot=False,
-    _semantic: TLESemantic | None = None,
+    _semantic=None,
     **fields,
 ) -> gpu_types.pipe_value:
     """
     Create a typed pipe descriptor.
 
-    Pipe is a hardware-independent TLE dataflow edge. Without readers= it has
-    one default reader. With readers=("name", ...) it is an explicit SPMC pipe
-    with named reader endpoints. The current MVP accepts GPU shared-memory
-    buffered tensors as fields and lowers CTA-scoped pipes to the GPU NVWS
-    backend.
-
-    The NVIDIA backend also recognizes a restricted multi-producer form after
-    warp specialization. Each producer must use only TMA copies, producers must
-    write disjoint field sets whose union covers the complete stage, and every
-    producer must acquire and commit the same stage sequence. The backend then
-    makes the reader's full barrier wait for one contribution from each
-    producer. Distinct fields may be static non-overlapping subslices of one
-    shared-memory allocation; overlapping fields, or aliasing that cannot be
-    proven disjoint, are rejected. A single producer continues to use the
-    ordinary SPSC lowering.
+    Pipe is a hardware-independent TLE dataflow edge. Without readers= it is an
+    SPSC pipe with one default reader. With readers=("name", ...) it is an
+    explicit SPMC pipe with named reader endpoints. The current MVP accepts GPU
+    shared-memory buffered tensors as fields and lowers CTA-scoped pipes to the
+    GPU NVWS backend.
 
     one_shot=True models a single ready/full edge. The writer still commits and
     readers still wait, but acquire/release/close are not part of the contract.
@@ -130,7 +113,9 @@ def pipe(
         raise ValueError("tle.pipe requires at least one payload field")
 
     if mthreads_common.enabled() and mthreads_pipe.is_backend_builder(_semantic.builder):
-        mthreads_pipe.validate_pipe_options(scope, reader_names, one_shot, fields)
+        mthreads_pipe.validate_pipe_options(
+            scope, reader_names, one_shot, fields, builder=_semantic.builder
+        )
 
     for field_name, field in fields.items():
         _validate_public_name("field", field_name)
@@ -145,10 +130,40 @@ def pipe(
             raise ValueError(
                 f"tle.pipe field {field_name!r} leading dimension must equal capacity {capacity}, got {field.shape[0]}")
 
-    value = gpu_types.pipe_value(capacity, scope, name, fields, reader_names, one_shot=one_shot)
-    _semantic.builder.create_pipe_create(value._field_handles(_semantic), capacity, scope, name or "",
-                                         list(fields.keys()), list(reader_names or ()), one_shot)
-    return value
+    builder = _semantic.builder
+    field_handles = [field.handle for field in fields.values()]
+    field_names = list(fields.keys())
+    reader_names_list = list(reader_names or ())
+    # ``one_shot`` was added to the native pipe-create binding after the
+    # original mthreads TLE release.  Old mthreads builders have no capability
+    # marker and still accept the legacy seven-argument call; keep cyclic pipes
+    # source-compatible with those builders while one-shot has already been
+    # rejected by ``validate_pipe_options`` above.
+    legacy_mthreads_builder = (
+        mthreads_common.enabled()
+        and mthreads_pipe.is_backend_builder(builder)
+        and not hasattr(builder, "mthreads_tle_one_shot_pipe_version")
+    )
+    if legacy_mthreads_builder:
+        builder.create_pipe_create(
+            field_handles,
+            capacity,
+            scope,
+            name or "",
+            field_names,
+            reader_names_list,
+        )
+    else:
+        builder.create_pipe_create(
+            field_handles,
+            capacity,
+            scope,
+            name or "",
+            field_names,
+            reader_names_list,
+            one_shot,
+        )
+    return gpu_types.pipe_value(capacity, scope, name, fields, reader_names, one_shot=one_shot)
 
 
 pipe_slot = gpu_types.pipe_slot

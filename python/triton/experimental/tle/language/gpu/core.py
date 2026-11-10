@@ -19,21 +19,17 @@
 # SOFTWARE.
 
 # flagtree tle
-from __future__ import annotations
-
 import builtins
 import triton.language.core as tl
-from typing import Optional, Sequence, TYPE_CHECKING
+from typing import Optional, Sequence
 from enum import Enum
 from . import types as tle
-from . import semantic as tle_semantic
 from .mthreads import common as mthreads_common
 from .mthreads import buffer as mthreads_buffer
 from .mthreads import copy as mthreads_copy
 from .mthreads import warp_specialize as mthreads_warp_specialize
 from .mthreads import wgmma as mthreads_wgmma
 from .iluvatar import copy as iluvatar_copy
-from .iluvatar import layout as iluvatar_layout
 from triton.compiler.code_generator import flatten_values_to_ir, unflatten_ir_values
 
 from triton.language.core import (
@@ -43,9 +39,6 @@ from triton.language.core import (
     range as _tl_range,
 )
 
-if TYPE_CHECKING:
-    from .. import TLESemantic
-
 # Address space 3 matches the shared-memory space used in TritonGPU lowering.
 SHARED_MEMORY_ADDRESS_SPACE = 3
 
@@ -53,7 +46,7 @@ _WGMMA_PIPELINE_MODE_ATTR = "tle.wgmma_pipeline_mode"
 _WGMMA_PIPELINE_MODE_USER_PROMISE = "user_promise"
 
 
-def _mark_wgmma_user_promise(_semantic: TLESemantic | None, _generator):
+def _mark_wgmma_user_promise(_semantic, _generator):
     if _generator is None or _semantic is None:
         return
     # This module attribute is NVIDIA-specific and must not leak into mthreads IR.
@@ -216,20 +209,36 @@ def _deduplicate_warp_specialize_captures(worker_items):
 
 
 @tl.builtin
-def warp_specialize(functions_and_args, worker_num_warps, worker_num_regs, _semantic: TLESemantic | None = None,
-                    _generator=None):
+def warp_specialize(
+    functions_and_args,
+    worker_num_warps,
+    worker_num_regs,
+    default_is_producer=False,
+    _semantic=None,
+    _generator=None,
+):
     """
     Create an explicit GPU warp-specialized region.
 
     ``functions_and_args[0]`` is emitted into the default partition. Later
     entries are emitted into worker partitions, with their warp counts and
     requested register counts provided by ``worker_num_warps`` and
-    ``worker_num_regs``.
+    ``worker_num_regs``. On mthreads, ``default_is_producer=True`` marks the
+    default partition as the pipe producer and requires one consumer worker.
     """
     if _generator is None:
         raise ValueError("warp_specialize requires a Triton code generator")
     functions_and_args = tl._unwrap_if_constexpr(functions_and_args)
     mthreads_enabled = mthreads_common.enabled()
+    default_is_producer = tl._unwrap_if_constexpr(default_is_producer)
+    if not isinstance(default_is_producer, bool):
+        raise ValueError(
+            "warp_specialize default_is_producer must be a compile-time bool"
+        )
+    if default_is_producer and not mthreads_enabled:
+        raise ValueError(
+            "warp_specialize default_is_producer is only supported on mthreads"
+        )
     if mthreads_enabled:
         worker_num_warps, worker_num_regs = mthreads_warp_specialize.normalize_config(worker_num_warps, worker_num_regs)
     else:
@@ -274,7 +283,12 @@ def warp_specialize(functions_and_args, worker_num_warps, worker_num_regs, _sema
 
     builder.restore_insertion_point(insert_pt)
     if mthreads_enabled:
-        ws_op = mthreads_warp_specialize.create_op(builder, result_types, worker_num_warps)
+        ws_op = mthreads_warp_specialize.create_op(
+            builder,
+            result_types,
+            worker_num_warps,
+            default_is_producer,
+        )
     else:
         ws_op = builder.create_warp_specialize(result_types, worker_arg_handles, worker_num_warps)
     real_default_block = builder.create_block_with_parent(ws_op.get_default_region(), [])
@@ -310,7 +324,7 @@ def warp_specialize(functions_and_args, worker_num_warps, worker_num_regs, _sema
 
 
 @tl.builtin
-def memory_space(input, space, _builder=None, _semantic: TLESemantic | None = None):
+def memory_space(input, space, _builder=None, _semantic=None):
     '''
     Assign a memory space to the tensor :code:`input`.
 
@@ -334,7 +348,7 @@ def alloc(
     alias: Optional[tle.buffered_tensor] = None,
     alias_offset_bytes: int = 0,
     nv_mma_shared_layout=True,
-    _semantic: TLESemantic | None = None,
+    _semantic=None,
 ) -> tle.buffered_tensor:
     """
     Allocate local memory buffer
@@ -350,10 +364,6 @@ def alloc(
         nv_mma_shared_layout: Select an MMA-consumer-defined shared layout when
             ``layout`` is None. On mthreads this is materialized by the SQMMA
             lowering rather than as an NVIDIA encoding.
-            On iluvatar, ``True`` emits ``#ttg.swizzled_shared`` with ``useTcu``
-            when the tile is a TCU-eligible 2D operand; otherwise it uses the
-            generic swizzled encoding. An explicit ``nv_mma_shared_layout``
-            object is still rejected.
         _semantic: Semantic analyzer (internal use)
 
     Returns:
@@ -411,11 +421,6 @@ def alloc(
 
     # Map scope to storage (backward compatibility)
     storage = scope
-    if tle_semantic.COMMON_IR_ENABLED:
-        if storage is not tle.smem:
-            raise ValueError("GPU CommonIR currently supports only shared-memory buffers")
-        if alias is not None:
-            raise ValueError("GPU CommonIR alloc does not yet support alias buffers")
     mthreads_auto_sqmma_shared_layout = (mthreads_common.enabled() and storage == tle.smem
                                          and mthreads_wgmma.use_auto_shared_layout(layout, nv_mma_shared_layout))
 
@@ -431,10 +436,7 @@ def alloc(
 
         if layout is None:
             if storage == tle.smem:
-                if iluvatar_copy.enabled():
-                    layout, layout_handle = iluvatar_layout.select_default_smem_layout(
-                        _semantic.builder, unwrapped_shape, dtype, nv_mma_shared_layout)
-                elif mthreads_auto_sqmma_shared_layout or not nv_mma_shared_layout:
+                if mthreads_auto_sqmma_shared_layout or not nv_mma_shared_layout:
                     layout = tle.swizzled_shared_layout.make_default(rank=len(shape))
                     layout_handle = _semantic.builder.make_swizzled_shared_encoding_attr(
                         layout.vectorSize,
@@ -470,17 +472,6 @@ def alloc(
         else:
             # Use provided layout
             layout_handle = layout.to_ir(_semantic.builder)
-
-        if tle_semantic.COMMON_IR_ENABLED:
-            return tle_semantic.alloc(
-                unwrapped_shape,
-                dtype,
-                storage,
-                layout,
-                layout_handle,
-                init_value,
-                _semantic,
-            )
 
         if storage == tle.smem:
             if alias is not None:
@@ -542,7 +533,7 @@ def _normalize_barrier_init(init) -> str:
 _FIRST_VIRTUAL_NAMED_BARRIER_ID = 16
 
 
-def _reserve_named_barrier_ids(_semantic: TLESemantic | None, count: int) -> int:
+def _reserve_named_barrier_ids(_semantic, count: int) -> int:
     next_id = getattr(_semantic, "_tle_next_named_barrier_id", _FIRST_VIRTUAL_NAMED_BARRIER_ID)
     last_id = next_id + count - 1
     setattr(_semantic, "_tle_next_named_barrier_id", last_id + 1)
@@ -557,7 +548,7 @@ def _barrier_handle_key(handle):
         return id(handle)
 
 
-def _ensure_named_barrier_ids(slot: tle.barrier, _semantic: TLESemantic | None) -> None:
+def _ensure_named_barrier_ids(slot: tle.barrier, _semantic) -> None:
     if slot.named_base_id > 0:
         return
     key = slot.allocation_key
@@ -575,7 +566,7 @@ def _ensure_named_barrier_ids(slot: tle.barrier, _semantic: TLESemantic | None) 
     slot.type.named_base_id = base_id
 
 
-def _barrier_phase_tensor(phaseIdx, init: str, _semantic: TLESemantic | None) -> tl.tensor:
+def _barrier_phase_tensor(phaseIdx, init: str, _semantic) -> tl.tensor:
     init_polarity = 1 if init == tle.READY else 0
     raw_phase = _unwrap_barrier_constexpr(phaseIdx)
     if isinstance(raw_phase, int):
@@ -594,7 +585,7 @@ def _barrier_phase_tensor(phaseIdx, init: str, _semantic: TLESemantic | None) ->
     return phase
 
 
-def _barrier_slot(value: tle.barrier, _semantic: TLESemantic | None) -> tle.barrier:
+def _barrier_slot(value: tle.barrier, _semantic) -> tle.barrier:
     if not isinstance(value, tle.barrier):
         raise ValueError(f"barrier operation expects tle.gpu barrier, got {type(value).__name__}")
     if value.is_slot:
@@ -602,7 +593,7 @@ def _barrier_slot(value: tle.barrier, _semantic: TLESemantic | None) -> tle.barr
     return value.__getitem__(0, _semantic=_semantic)
 
 
-def _record_barrier_backend(slot: tle.barrier, backend: str, _semantic: TLESemantic | None) -> None:
+def _record_barrier_backend(slot: tle.barrier, backend: str, _semantic) -> None:
     if slot.allocation_key is not None and slot.static_index is not None:
         key = (slot.allocation_key, slot.static_index)
     elif slot.named_base_id > 0 and slot.static_index is not None:
@@ -619,7 +610,7 @@ def _record_barrier_backend(slot: tle.barrier, backend: str, _semantic: TLESeman
     uses[key] = backend
 
 
-def _tma_completion_barrier_slot(value, _semantic: TLESemantic | None) -> tle.barrier:
+def _tma_completion_barrier_slot(value, _semantic) -> tle.barrier:
     if not isinstance(value, tle.barrier):
         raise ValueError(f"TMA copy barrier expects tle.gpu barrier, got {type(value).__name__}")
     if not value.is_slot and value.num_barriers != 1:
@@ -641,7 +632,7 @@ def alloc_barriers(
     arrive_count=1,
     init=tle.PENDING,
     expect_bytes=None,
-    _semantic: TLESemantic | None = None,
+    _semantic=None,
     _generator=None,
 ) -> tle.barrier:
     """Allocate a TLE GPU barrier array."""
@@ -684,7 +675,7 @@ def alloc_barrier(
     arrive_count=1,
     init=tle.PENDING,
     expect_bytes=None,
-    _semantic: TLESemantic | None = None,
+    _semantic=None,
     _generator=None,
 ) -> tle.barrier:
     """Allocate a single TLE GPU barrier."""
@@ -699,7 +690,7 @@ def alloc_barrier(
 
 
 @tl.builtin
-def barrier_wait(barr, phaseIdx=None, _semantic: TLESemantic | None = None) -> None:
+def barrier_wait(barr, phaseIdx=None, _semantic=None) -> None:
     """Wait on a TLE GPU barrier slot."""
     slot = _barrier_slot(barr, _semantic)
     if phaseIdx is None:
@@ -721,7 +712,7 @@ def barrier_wait(barr, phaseIdx=None, _semantic: TLESemantic | None = None) -> N
 
 
 @tl.builtin
-def barrier_arrive(barr, arrive_count=1, phaseIdx=None, _semantic: TLESemantic | None = None) -> None:
+def barrier_arrive(barr, arrive_count=1, phaseIdx=None, _semantic=None) -> None:
     """Arrive on a TLE GPU barrier slot."""
     slot = _barrier_slot(barr, _semantic)
     arrive_count = _require_barrier_int(arrive_count, "arrive_count")
@@ -788,12 +779,11 @@ def _require_transpose_order(order, rank: int, name: str):
         raise ValueError(f"{name} transpose order must be a permutation of rank {rank}")
 
 
-def _transpose_wgmma_smem_operand(value: tle.buffered_tensor, name: str,
-                                  _semantic: TLESemantic | None) -> tle.buffered_tensor:
+def _transpose_wgmma_smem_operand(value: tle.buffered_tensor, name: str, _semantic) -> tle.buffered_tensor:
     _require_rank2_wgmma_operand(value, name)
     order = [1, 0]
     _require_transpose_order(order, len(value.type.shape), name)
-    handle = _semantic.builder.create_memdesc_trans(tle_semantic.get_memdesc(value, _semantic), order)
+    handle = _semantic.builder.create_memdesc_trans(value.handle, order)
     shape = [value.type.shape[i] for i in order]
 
     alloc_shape = value.type.alloc_shape
@@ -819,7 +809,7 @@ _WGMMA_ALLOWED_OPERAND_TYPE_PAIRS = (
 )
 
 
-def _canonicalize_wgmma_operands(a, b, trans_a: bool, trans_b: bool, _semantic: TLESemantic | None):
+def _canonicalize_wgmma_operands(a, b, trans_a: bool, trans_b: bool, _semantic):
     a = tl._unwrap_if_constexpr(a)
     b = tl._unwrap_if_constexpr(b)
 
@@ -877,7 +867,7 @@ def wgmma(
     out_dtype=tl.float32,
     trans_a: tl.constexpr = False,
     trans_b: tl.constexpr = False,
-    _semantic: TLESemantic | None = None,
+    _semantic=None,
 ) -> tl.tensor:
     """
     Issue an asynchronous Hopper WGMMA.
@@ -960,13 +950,9 @@ def wgmma(
             raise ValueError(f"wgmma acc dtype must be {ret_scalar_ty}, got {acc.dtype}")
         acc_handle = acc.handle
 
-    # A transposed shared operand already holds a native descriptor view.
-    a_handle = tle_semantic.get_memdesc(a,
-                                        _semantic) if isinstance(a, tle.buffered_tensor) and not trans_a else a.handle
-    b_handle = b.handle if trans_b else tle_semantic.get_memdesc(b, _semantic)
     result = builder.create_tle_wgmma(
-        a_handle,
-        b_handle,
+        a.handle,
+        b.handle,
         acc_handle,
         input_precision,
         max_num_imprecise_acc,
@@ -976,7 +962,7 @@ def wgmma(
 
 
 @tl.builtin
-def wgmma_wait(pendings, acc=None, _semantic: TLESemantic | None = None, _generator=None) -> tl.tensor:
+def wgmma_wait(pendings, acc=None, _semantic=None, _generator=None) -> tl.tensor:
     """Wait until ``pendings`` or fewer async WGMMA groups remain outstanding."""
     _mark_wgmma_user_promise(_semantic, _generator)
     if acc is None and isinstance(pendings, tl.tensor):
@@ -1006,8 +992,8 @@ def copy(
     shape,
     offsets: Sequence[constexpr | tensor] = None,
     barrier=None,
-    mask=None,
-    _semantic: TLESemantic | None = None,
+    completion_group_leader=None,
+    _semantic=None,
 ) -> None:
     """
     High-performance data copy operation supporting TMA (Tensor Memory Accelerator) transfers.
@@ -1039,10 +1025,10 @@ def copy(
             to specify the starting coordinates within the tensor. Required for TMA copy.
         barrier: Optional TLE GPU mbarrier completion barrier for global-to-shared TMA copy.
             The barrier must come from ``tle.gpu.alloc_barrier(s)(expect_bytes=...)``.
-        mask: Optional elementwise mask for standard pointer-tensor copies. For
-            global-to-local copies, masked elements are written to local memory
-            as zero. For local-to-global copies, masked elements are not stored.
-            TMA descriptor copies do not accept a mask.
+        completion_group_leader: MThreads-only explicit completion grouping. Use ``True``
+            on the first copy sharing a barrier and ``False`` on subsequent copies. The
+            first copy records the group's total ``expect_bytes`` and performs the sole
+            producer arrival; every copy contributes transfer completion to that barrier.
         _semantic: Internal semantic analyzer for validation and compilation (user-provided)
 
     Raises:
@@ -1061,9 +1047,6 @@ def copy(
             bar = tle.gpu.alloc_barrier(expect_bytes=64 * 64 * 2)
             tle.copy(tma_desc, local_buf, [64, 64], [x_offset, y_offset], barrier=bar)
             tle.gpu.barrier_wait(bar, phaseIdx=0)
-
-        Masked global -> local copy with zero fill:
-            tle.copy(global_ptrs, local_buf, [64, 128], mask=valid)
     """
     mthreads_enabled = mthreads_common.enabled()
     iluvatar_enabled = iluvatar_copy.enabled()
@@ -1073,8 +1056,7 @@ def copy(
         dst: tle.buffered_tensor,
         shape: tuple,
         direction,
-        mask=None,
-        _semantic: TLESemantic | None = None,
+        _semantic=None,
     ) -> None:
         if mthreads_enabled:
             mthreads_copy.validate_normal_copy(src, dst, shape, direction)
@@ -1089,12 +1071,8 @@ def copy(
             import warnings
             warnings.warn("TLE semantic analysis module not available, skipping validation", UserWarning)
 
-        mask = tl._unwrap_if_constexpr(mask)
-        if mask is not None:
-            mask = _semantic.to_tensor(mask)
-        # A masked global-to-local copy implicitly uses other=0. NVIDIA
-        # cp.async can implement this contract directly with zero-fill.
-        zero_fill = (_semantic.to_tensor(0.0) if direction == CopyDirection.GM_TO_LOCAL and mask is not None else None)
+        mask = None
+        other = None
         boundary_check = ()
         padding_option = ""
         cache_modifier = ""
@@ -1106,18 +1084,15 @@ def copy(
                 if iluvatar_enabled:
                     # Iluvatar's semantic.load carries an extra `stride` (SME) slot
                     # right after `other`; TLE copy never uses the SME path.
-                    tt_load = _semantic.load(src, mask, zero_fill, None, boundary_check, padding_option, cache_modifier,
+                    tt_load = _semantic.load(src, mask, other, None, boundary_check, padding_option, cache_modifier,
                                              eviction_policy, volatile)
                 else:
                     # None fills the FlagTree hints slot; TLE copy has no hints to pass.
                     load_extra_args = () if mthreads_enabled else (None, )
-                    tt_load = _semantic.load(src, mask, zero_fill, boundary_check, padding_option, cache_modifier,
+                    tt_load = _semantic.load(src, mask, other, boundary_check, padding_option, cache_modifier,
                                              eviction_policy, volatile, *load_extra_args)
                 local_ptrs = local_ptr(dst, _make_full_indices(dst, _semantic), _semantic=_semantic)
-                # Every local element is initialized. A false source mask is
-                # represented by the loaded zero rather than by suppressing
-                # the shared-memory store.
-                _semantic.store(local_ptrs, tt_load, None, boundary_check, cache_modifier, eviction_policy)
+                _semantic.store(local_ptrs, tt_load, mask, boundary_check, cache_modifier, eviction_policy)
             else:
                 local_ptrs = local_ptr(src, _make_full_indices(src, _semantic), _semantic=_semantic)
                 load = tl.load(local_ptrs, _semantic=_semantic)
@@ -1133,7 +1108,7 @@ def copy(
         shape: tuple,
         offsets: Sequence[constexpr | tensor],
         barrier=None,
-        _semantic: TLESemantic | None = None,
+        _semantic=None,
     ) -> None:
         # Parameter validation
         valid_types = (tle.buffered_tensor, tl.tensor_descriptor)
@@ -1225,56 +1200,35 @@ def copy(
             shape = tuple(shape)
         else:
             raise ValueError(f"Shape parameter must be tuple or list, but got {type(shape)}")
-    if tle_semantic.COMMON_IR_ENABLED:
-        if mask is not None:
-            raise ValueError("GPU CommonIR copy does not yet support masks")
-        descriptor = src if isinstance(
-            src, tl.tensor_descriptor) else (dst if isinstance(dst, tl.tensor_descriptor) else None)
-        barrier_slot = None
-        if barrier is not None:
-            if descriptor is None or direction != CopyDirection.GM_TO_LOCAL:
-                raise ValueError("TMA copy barrier is only supported for global-to-shared TMA copy")
-            barrier_slot = _tma_completion_barrier_slot(barrier, _semantic)
-        if descriptor is not None:
-            if offsets is None:
-                raise ValueError("TMA copy requires offsets")
-            if not isinstance(offsets, (tuple, list)):
-                if hasattr(offsets, '__iter__'):
-                    offsets = tuple(offsets)
-                else:
-                    raise ValueError(f"Offsets must be tuple or list, but got {type(offsets)}")
-            if len(offsets) != len(descriptor.shape):
-                raise ValueError("Offsets and descriptor shape must have the same rank")
-        elif tl._unwrap_if_constexpr(offsets) is not None:
-            raise ValueError("GPU CommonIR normal copy does not support offsets; offset the global pointers instead")
-        return tle_semantic.copy(
-            src,
-            dst,
-            shape,
-            offsets if descriptor is not None else None,
-            direction,
-            _semantic,
-            completion_barrier=barrier_slot,
-        )
     if is_normcopy:
         if barrier is not None:
             raise ValueError("copy barrier is only supported for TMA global-to-shared copy")
-        return normcopy(src, dst, shape, direction, mask, _semantic)
-    if mask is not None:
-        raise ValueError("copy mask is only supported for standard pointer-tensor copies")
+        if completion_group_leader is not None:
+            raise ValueError("completion_group_leader is only supported for TMA global-to-shared copy")
+        return normcopy(src, dst, shape, direction, _semantic)
     if mthreads_enabled:
         barrier_slot = None
         if barrier is not None:
             if direction != CopyDirection.GM_TO_LOCAL:
                 raise ValueError("TMA copy barrier is only supported for global-to-shared TMA copy")
             barrier_slot = _tma_completion_barrier_slot(barrier, _semantic)
-        return mthreads_copy.tmacopy(src, dst, direction, shape, offsets, barrier_slot, _semantic)
+        return mthreads_copy.tmacopy(
+            src,
+            dst,
+            direction,
+            shape,
+            offsets,
+            barrier_slot,
+            completion_group_leader,
+            _semantic,
+        )
     else:
+        if completion_group_leader is not None:
+            raise ValueError("completion_group_leader is only supported on MThreads")
         return tmacopy(src, dst, direction, shape, offsets, barrier, _semantic)
 
 
-def _expand_index_to_shape(index: tl.tensor, shape: Sequence[int], axis: int,
-                           _semantic: TLESemantic | None) -> tl.tensor:
+def _expand_index_to_shape(index: tl.tensor, shape: Sequence[int], axis: int, _semantic) -> tl.tensor:
     idx = index
     for _ in builtins.range(axis):
         idx = tl.expand_dims(idx, 0, _semantic=_semantic)
@@ -1283,7 +1237,7 @@ def _expand_index_to_shape(index: tl.tensor, shape: Sequence[int], axis: int,
     return tl.broadcast_to(idx, *shape, _semantic=_semantic)
 
 
-def _make_full_indices(buffer: tle.buffered_tensor, _semantic: TLESemantic | None) -> tuple[tl.tensor, ...]:
+def _make_full_indices(buffer: tle.buffered_tensor, _semantic) -> tuple[tl.tensor, ...]:
     shape = tuple(int(tl._unwrap_if_constexpr(dim)) for dim in buffer.type.shape)
     indices = []
     for axis, dim in enumerate(shape):
@@ -1297,7 +1251,7 @@ def _make_full_indices(buffer: tle.buffered_tensor, _semantic: TLESemantic | Non
 def local_ptr(
     buffer: tle.buffered_tensor,
     indices: Optional[Sequence] = None,
-    _semantic: TLESemantic | None = None,
+    _semantic=None,
     _generator=None,
 ) -> tl.tensor:
     """
@@ -1398,9 +1352,8 @@ def local_ptr(
     else:
         result_ty = tl.block_type(ptr_dtype, list(view_shape))
         result_ir = result_ty.to_ir(_semantic.builder)
-    if tle_semantic.COMMON_IR_ENABLED and remote_buffer_marker:
-        raise ValueError("GPU CommonIR local_ptr does not yet support remote buffers")
-    local_ptr_op = tle_semantic.local_ptr(result_ir, buffer, idx_tensors, _semantic)
+    handles = [idx.handle for idx in idx_tensors]
+    local_ptr_op = _semantic.builder.create_local_pointers(result_ir, buffer.handle, *handles)
 
     result_tensor = tl.tensor(local_ptr_op.get_result(0), result_ty)
 

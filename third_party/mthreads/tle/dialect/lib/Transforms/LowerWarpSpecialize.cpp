@@ -24,6 +24,8 @@ namespace ttg = triton::gpu;
 
 static constexpr StringLiteral kStaticWarpSpecializeAttr =
     "musa_tle.static_warp_specialize";
+static constexpr StringLiteral kDefaultProducerAttr =
+    "musa_tle.default_producer";
 class PrepareWarpSpecializePass
     : public impl::TritonMUSAGPUTLEPrepareWarpSpecializeBase<
           PrepareWarpSpecializePass> {
@@ -36,128 +38,105 @@ class PrepareWarpSpecializePass
     Block &entry = func.getBody().front();
     if (ws->getBlock() != &entry)
       return ws.emitOpError(
-          "MUSA TLE static warp_specialize must be in the function entry "
+          "mthreads TLE static warp_specialize must be in the function entry "
           "block");
     if (!ws->getNextNode() || !isa<triton::ReturnOp>(ws->getNextNode()) ||
         ws->getNextNode()->getNextNode())
       return ws.emitOpError(
-          "MUSA TLE static warp_specialize must be the final operation "
+          "mthreads TLE static warp_specialize must be the final operation "
           "before tt.return");
     if (ws.getNumResults() != 0)
       return ws.emitOpError(
-          "MUSA TLE static warp_specialize does not support results");
+          "mthreads TLE static warp_specialize does not support results");
 
     auto partitions = ws.getPartitionOp();
-    auto workerRegions = partitions.getPartitionRegions();
-    ArrayRef<int32_t> workerWarps = ws.getPartitionNumWarps();
-    if (workerRegions.empty())
+    auto partitionRegions = partitions.getPartitionRegions();
+    ArrayRef<int32_t> partitionNumWarps = ws.getPartitionNumWarps();
+    if (partitionRegions.empty() ||
+        partitionRegions.size() != partitionNumWarps.size())
       return ws.emitOpError(
-          "MUSA TLE static warp_specialize requires at least one worker "
-          "partition");
-    if (workerRegions.size() != workerWarps.size())
+          "mthreads TLE static warp_specialize requires at least one static "
+          "worker partition with a matching warp count");
+    if (llvm::any_of(partitionNumWarps,
+                     [](int32_t count) { return count <= 0; }))
+      return ws.emitOpError("mthreads TLE static warp_specialize requires "
+                            "positive worker warp counts");
+    if (ws->hasAttr(kDefaultProducerAttr) && partitionRegions.size() != 1)
       return ws.emitOpError(
-          "MUSA TLE static warp_specialize worker region and warp-count "
-          "sizes must match");
-    if (auto requestedRegisters = ws.getRequestedRegisters()) {
-      if (requestedRegisters->size() != workerRegions.size())
+          "mthreads TLE default producer requires exactly one consumer "
+          "worker partition");
+
+    Region &consumerRegion = ws.getDefaultRegion();
+    if (!consumerRegion.hasOneBlock() ||
+        llvm::any_of(partitionRegions,
+                     [](Region &region) { return !region.hasOneBlock(); }))
+      return ws.emitOpError(
+          "mthreads TLE static warp_specialize requires single-block regions");
+
+    Block &consumerBlock = consumerRegion.front();
+    auto consumerYield =
+        dyn_cast<ttg::WarpYieldOp>(consumerBlock.getTerminator());
+    if (!consumerYield || consumerYield.getNumOperands() != 0)
+      return ws.emitOpError(
+          "mthreads TLE static warp_specialize consumer must yield no values");
+    for (Region &partition : partitionRegions) {
+      if (!isa<ttg::WarpReturnOp>(partition.front().getTerminator()))
         return ws.emitOpError(
-            "MUSA TLE static warp_specialize requested-register count must "
-            "match the worker partition count");
+            "mthreads TLE static worker partitions must end with "
+            "ttg.warp_return");
     }
 
-    Region &defaultRegion = ws.getDefaultRegion();
-    if (!defaultRegion.hasOneBlock())
-      return ws.emitOpError(
-          "MUSA TLE static warp_specialize requires a single-block default "
-          "region");
-
-    Block &defaultBlock = defaultRegion.front();
-    auto defaultYield =
-        dyn_cast<ttg::WarpYieldOp>(defaultBlock.getTerminator());
-    if (!defaultYield || defaultYield.getNumOperands() != 0)
-      return ws.emitOpError(
-          "MUSA TLE static warp_specialize default region must yield no "
-          "values");
-
     ValueRange captures = partitions.getExplicitCaptures();
-    for (auto [workerIndex, workerRegion] : llvm::enumerate(workerRegions)) {
-      if (!workerRegion.hasOneBlock())
-        return ws.emitOpError()
-               << "MUSA TLE static warp_specialize worker partition #"
-               << workerIndex << " must be single-block";
-      Block &workerBlock = workerRegion.front();
-      if (!isa<ttg::WarpReturnOp>(workerBlock.getTerminator()))
-        return ws.emitOpError()
-               << "MUSA TLE static warp_specialize worker partition #"
-               << workerIndex << " must end with ttg.warp_return";
-      if (workerBlock.getNumArguments() != captures.size())
-        return ws.emitOpError()
-               << "MUSA TLE static warp_specialize worker partition #"
-               << workerIndex << " capture count mismatch";
-      for (auto [captureIndex, argumentAndCapture] :
-           llvm::enumerate(llvm::zip(workerBlock.getArguments(), captures))) {
-        auto [argument, capture] = argumentAndCapture;
-        if (argument.getType() != capture.getType())
-          return ws.emitOpError()
-                 << "MUSA TLE static warp_specialize worker partition #"
-                 << workerIndex << " capture #" << captureIndex
-                 << " type mismatch";
-      }
+    for (Region &partition : partitionRegions) {
+      if (partition.front().getNumArguments() != captures.size())
+        return ws.emitOpError(
+            "mthreads TLE static warp_specialize worker capture count "
+            "mismatch");
     }
     DominanceInfo dominance(func);
     for (Value capture : captures) {
       if (!dominance.dominates(capture, ws.getOperation()))
         return ws.emitOpError(
-            "MUSA TLE static warp_specialize capture must dominate the "
+            "mthreads TLE static warp_specialize capture must dominate the "
             "partition split");
     }
 
     int32_t baseNumWarps = ttg::lookupNumWarps(ws);
     if (baseNumWarps <= 0)
       return ws.emitOpError(
-          "MUSA TLE static warp_specialize default warp count must be "
+          "mthreads TLE static warp_specialize consumer warp count must be "
           "positive");
     int32_t warpSize = ttg::TritonGPUDialect::getThreadsPerWarp(mod);
-    if (warpSize <= 0)
-      return ws.emitOpError(
-          "MUSA TLE static warp_specialize warp size must be positive");
-
-    int64_t nextWarp = baseNumWarps;
-    SmallVector<int32_t> workerStartIds;
-    workerStartIds.reserve(workerWarps.size());
-    for (auto [workerIndex, numWarps] : llvm::enumerate(workerWarps)) {
-      if (numWarps <= 0)
-        return ws.emitOpError()
-               << "MUSA TLE static warp_specialize worker partition #"
-               << workerIndex << " requires a positive static warp count";
-      if (nextWarp > std::numeric_limits<int32_t>::max())
+    SmallVector<int32_t> warpGroupStartIds;
+    int64_t totalNumWarps64 = baseNumWarps;
+    for (int32_t count : partitionNumWarps) {
+      if (totalNumWarps64 > std::numeric_limits<int32_t>::max())
         return ws.emitOpError(
-            "MUSA TLE static warp_specialize warp range exceeds int32");
-      workerStartIds.push_back(static_cast<int32_t>(nextWarp));
-      nextWarp += numWarps;
-      if (nextWarp > std::numeric_limits<int32_t>::max())
-        return ws.emitOpError(
-            "MUSA TLE static warp_specialize warp range exceeds int32");
+            "mthreads TLE static warp_specialize warp count overflow");
+      warpGroupStartIds.push_back(static_cast<int32_t>(totalNumWarps64));
+      totalNumWarps64 += count;
     }
-    if (nextWarp > std::numeric_limits<int32_t>::max() / warpSize)
+    int64_t totalThreads64 = totalNumWarps64 * warpSize;
+    if (warpSize <= 0 ||
+        totalNumWarps64 > std::numeric_limits<int32_t>::max() ||
+        totalThreads64 > std::numeric_limits<int32_t>::max())
       return ws.emitOpError(
-          "MUSA TLE static warp_specialize thread count exceeds int32");
+          "mthreads TLE static warp_specialize thread count overflow");
 
-    int32_t totalNumWarps = static_cast<int32_t>(nextWarp);
+    int32_t totalNumWarps = static_cast<int32_t>(totalNumWarps64);
     if (auto existingStartIds = ws.getWarpGroupStartIds()) {
-      if (existingStartIds->size() != workerStartIds.size() ||
-          !llvm::equal(*existingStartIds, workerStartIds))
+      if (!llvm::equal(*existingStartIds, warpGroupStartIds))
         return ws.emitOpError(
-            "MUSA TLE static worker warp ranges must follow declaration "
-            "order after the default partition");
+            "mthreads TLE static worker partitions have inconsistent start "
+            "warp IDs");
     } else {
-      ws.setWarpGroupStartIds(workerStartIds);
+      ws.setWarpGroupStartIds(warpGroupStartIds);
     }
     if (auto existing =
             mod->getAttrOfType<IntegerAttr>("ttg.total-num-warps")) {
       if (existing.getInt() != totalNumWarps)
         return ws.emitOpError(
-            "MUSA TLE static warp_specialize conflicts with existing "
+            "mthreads TLE static warp_specialize conflicts with existing "
             "ttg.total-num-warps");
     } else {
       mod->setAttr("ttg.total-num-warps",
@@ -179,7 +158,7 @@ public:
       return;
     if (marked.size() != 1) {
       marked[1].emitOpError(
-          "MUSA TLE static warp_specialize supports exactly one marked "
+          "mthreads TLE static warp_specialize supports exactly one marked "
           "operation per module");
       return signalPassFailure();
     }
